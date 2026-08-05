@@ -11,14 +11,33 @@ class GalleryComment {
   final String time;
   final String content;
 
+  /// E-Hentai comment id (from `<div class="c1" id="c_123456">`), 0 when absent.
+  final BigInt id;
+
+  /// Comment vote score (upvotes - downvotes), 0 when unavailable.
+  final int score;
+
+  /// Vote link parsed from the detail page HTML (`...act=vote&comment_id=...&vote=1`).
+  /// Relative URLs are completed against the site URL at vote time.
+  final String voteUrl;
+
   const GalleryComment({
     required this.author,
     required this.time,
     required this.content,
+    required this.id,
+    required this.score,
+    required this.voteUrl,
   });
 
   @override
-  int get hashCode => author.hashCode ^ time.hashCode ^ content.hashCode;
+  int get hashCode =>
+      author.hashCode ^
+      time.hashCode ^
+      content.hashCode ^
+      id.hashCode ^
+      score.hashCode ^
+      voteUrl.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -27,7 +46,10 @@ class GalleryComment {
           runtimeType == other.runtimeType &&
           author == other.author &&
           time == other.time &&
-          content == other.content;
+          content == other.content &&
+          id == other.id &&
+          score == other.score &&
+          voteUrl == other.voteUrl;
 }
 
 class GalleryDetail {

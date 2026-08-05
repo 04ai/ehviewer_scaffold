@@ -71,7 +71,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => 838127887;
+  int get rustContentHash => 1671527229;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -180,6 +180,8 @@ abstract class RustLibApi extends BaseApi {
 
   String crateApiTranslateTagSync(
       {required String namespace, required String tag});
+
+  Future<String> crateApiVoteComment({required String url});
 
   Future<String> crateApiVoteGallery(
       {required String gid, required String token, required int rating});
@@ -1027,6 +1029,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<String> crateApiVoteComment({required String url}) {
+    return handler.executeNormal(NormalTask(
+      callFfi: (port_) {
+        final serializer = SseSerializer(generalizedFrbRustBinding);
+        sse_encode_String(url, serializer);
+        pdeCallFfi(generalizedFrbRustBinding, serializer,
+            funcId: 33, port: port_);
+      },
+      codec: SseCodec(
+        decodeSuccessData: sse_decode_String,
+        decodeErrorData: sse_decode_AnyhowException,
+      ),
+      constMeta: kCrateApiVoteCommentConstMeta,
+      argValues: [url],
+      apiImpl: this,
+    ));
+  }
+
+  TaskConstMeta get kCrateApiVoteCommentConstMeta => const TaskConstMeta(
+        debugName: "vote_comment",
+        argNames: ["url"],
+      );
+
+  @override
   Future<String> crateApiVoteGallery(
       {required String gid, required String token, required int rating}) {
     return handler.executeNormal(NormalTask(
@@ -1036,7 +1062,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         sse_encode_String(token, serializer);
         sse_encode_u_32(rating, serializer);
         pdeCallFfi(generalizedFrbRustBinding, serializer,
-            funcId: 33, port: port_);
+            funcId: 34, port: port_);
       },
       codec: SseCodec(
         decodeSuccessData: sse_decode_String,
@@ -1158,12 +1184,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   GalleryComment dco_decode_gallery_comment(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 3)
-      throw Exception('unexpected arr length: expect 3 but see ${arr.length}');
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
     return GalleryComment(
       author: dco_decode_String(arr[0]),
       time: dco_decode_String(arr[1]),
       content: dco_decode_String(arr[2]),
+      id: dco_decode_u_64(arr[3]),
+      score: dco_decode_i_32(arr[4]),
+      voteUrl: dco_decode_String(arr[5]),
     );
   }
 
@@ -1487,8 +1516,16 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_author = sse_decode_String(deserializer);
     var var_time = sse_decode_String(deserializer);
     var var_content = sse_decode_String(deserializer);
+    var var_id = sse_decode_u_64(deserializer);
+    var var_score = sse_decode_i_32(deserializer);
+    var var_voteUrl = sse_decode_String(deserializer);
     return GalleryComment(
-        author: var_author, time: var_time, content: var_content);
+        author: var_author,
+        time: var_time,
+        content: var_content,
+        id: var_id,
+        score: var_score,
+        voteUrl: var_voteUrl);
   }
 
   @protected
@@ -1900,6 +1937,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.author, serializer);
     sse_encode_String(self.time, serializer);
     sse_encode_String(self.content, serializer);
+    sse_encode_u_64(self.id, serializer);
+    sse_encode_i_32(self.score, serializer);
+    sse_encode_String(self.voteUrl, serializer);
   }
 
   @protected

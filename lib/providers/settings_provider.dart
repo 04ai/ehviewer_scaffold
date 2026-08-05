@@ -11,7 +11,8 @@ class AppearanceSettings extends ChangeNotifier {
   bool followSystemDark = true;
   bool amoledBlack = false;
   bool pixelShift = true;
-  String themeColor = '默认 (紫)';
+  bool glassEffect = true;
+  String themeColor = '纯净白';
   bool showJpnTitle = false;
   bool showTagTranslation = false;
   bool autoClearCache = true;
@@ -27,7 +28,8 @@ class AppearanceSettings extends ChangeNotifier {
     followSystemDark = prefs.getBool('appearance_system_dark') ?? true;
     amoledBlack = prefs.getBool('appearance_amoled_black') ?? false;
     pixelShift = prefs.getBool('appearance_pixel_shift') ?? true;
-    themeColor = prefs.getString('appearance_theme_color') ?? '默认 (紫)';
+    glassEffect = prefs.getBool('appearance_glass_effect') ?? true;
+    themeColor = prefs.getString('appearance_theme_color') ?? '纯净白';
     showJpnTitle = prefs.getBool('appearance_show_jpn_title') ?? false;
     showTagTranslation = prefs.getBool('appearance_show_tag_translation') ?? false;
     autoClearCache = prefs.getBool('appearance_auto_clear_cache') ?? true;
@@ -55,6 +57,13 @@ class AppearanceSettings extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('appearance_pixel_shift', val);
     pixelShift = val;
+    notifyListeners();
+  }
+
+  Future<void> setGlassEffect(bool val) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('appearance_glass_effect', val);
+    glassEffect = val;
     notifyListeners();
   }
 
@@ -117,14 +126,29 @@ class AppearanceSettings extends ChangeNotifier {
       case '默认 (紫)':
       default: seed = const Color(0xFF6750A4); break;
     }
-    final baseBrightness = followSystemDark
-        ? WidgetsBinding.instance.platformDispatcher.platformBrightness
-        : Brightness.light;
+
+    // 明暗优先级（从高到低）：
+    //  1. AMOLED 黑开关：开了必然深色 + 纯黑（最高优先级，覆盖一切）
+    //  2. 主题色强制：极客黑 → 深色；纯净白 → 浅色
+    //  3. 跟随系统开关 → 系统明暗；否则浅色
+    final bool forceDark = themeColor == '极客黑' || amoledBlack;
+    final bool forceLight = themeColor == '纯净白' && !amoledBlack;
+    final Brightness baseBrightness;
+    if (forceDark) {
+      baseBrightness = Brightness.dark;
+    } else if (forceLight) {
+      baseBrightness = Brightness.light;
+    } else {
+      baseBrightness = followSystemDark
+          ? WidgetsBinding.instance.platformDispatcher.platformBrightness
+          : Brightness.light;
+    }
     final isDark = baseBrightness == Brightness.dark;
-    
-    // Premium dark mode: Deep OLED black or very dark slate
-    final darkScaffold = amoledBlack ? Colors.black : const Color(0xFF121212);
-    final darkSurface = amoledBlack ? Colors.black : const Color(0xFF1E1E1E);
+
+    // Premium dark mode: Deep OLED black or very dark slate.
+    // AMOLED 黑 / 极客黑 均强制纯黑。
+    final darkScaffold = (amoledBlack || forceDark) ? Colors.black : const Color(0xFF121212);
+    final darkSurface = (amoledBlack || forceDark) ? Colors.black : const Color(0xFF1E1E1E);
     
     // Premium light mode
     final lightScaffold = themeColor == '纯净白' ? Colors.white : const Color(0xFFF7F7F9);

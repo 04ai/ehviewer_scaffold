@@ -18,8 +18,10 @@ class AboutSettingsPage extends StatelessWidget {
           const Center(
             child: Text('EH Viewer Scaffold', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
           ),
-          const Center(
-            child: Text('版本 1.0.0', style: TextStyle(color: Colors.black54)),
+          Center(
+            child: Text('版本 1.0.0',
+                style: TextStyle(
+                    color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6))),
           ),
           const SizedBox(height: 40),
           const Divider(height: 1, indent: 16),

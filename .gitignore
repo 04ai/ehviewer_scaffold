@@ -42,6 +42,7 @@ migrate_working_dir/
 
 # Reasonix 会话元数据
 /.reasonix/
+/reasonix.toml
 
 # Android gradle 构建产物
 /android/build/

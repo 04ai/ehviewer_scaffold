@@ -21,6 +21,7 @@ import 'widgets/pixel_shift_wrapper.dart';
 import 'widgets/app_lock_wrapper.dart';
 import 'utils/secure_cookies.dart';
 import 'widgets/gallery_item_widget.dart';
+import 'widgets/glass.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'providers/history_provider.dart';
 import 'providers/settings_provider.dart';
@@ -212,13 +213,6 @@ class AccountInfoNotifier extends StateNotifier<AccountInfo> {
 // ─── 当前页面 Provider ────────────────────────────────────────────────────────
 final currentPageProvider = StateProvider<String>((ref) => 'home');
 
-/// 搜索栏统一的柔和底色（暗色半透明白 / 亮色半透明黑），替代突兀的实色块。
-Color searchFieldColor(BuildContext context) {
-  return Theme.of(context).brightness == Brightness.dark
-      ? Colors.white.withOpacity(0.06)
-      : Colors.black.withOpacity(0.05);
-}
-
 /// 申请应用运行所需的核心权限：
 /// - 联网：系统自动处理，无需运行时申请
 /// - 存储：Android 10+ 使用 Scoped Storage，不需要显式申请
@@ -407,6 +401,16 @@ class ThemeTween extends Tween<ThemeData?> {
     if (begin == null) return end;
     return ThemeData.lerp(begin!, end!, t);
   }
+
+  // Tween 默认不覆写 ==，而 builder 每次 build 都会 new 一个 ThemeTween，
+  // 导致主题未变化时也重放 350ms 渐变（每次 setState 都闪一下）。
+  // ThemeData 实现了深比较 ==，相同参数构建的 ThemeData 相等。
+  @override
+  bool operator ==(Object other) =>
+      other is ThemeTween && other.begin == begin && other.end == end;
+
+  @override
+  int get hashCode => Object.hash(begin, end);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -477,7 +481,26 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
     _searchController.dispose();
     _searchFocusNode.dispose();
     _tabIndicatorTimer?.cancel();
+    _drawerBlurTimer?.cancel();
     super.dispose();
+  }
+
+  // ── 抽屉毛玻璃：动画期间降级为纯半透明，动画结束再启用模糊 ──────────
+  // BackdropFilter 在抽屉开合动画的 ~250ms 内每帧重采样背景，低端 GPU
+  // 会掉帧；动画结束后背景静止，模糊只算一次，等价于"静态模糊快照"。
+  bool _drawerBlurOn = false;
+  Timer? _drawerBlurTimer;
+
+  void _onDrawerChanged(bool open) {
+    _drawerBlurTimer?.cancel();
+    if (open) {
+      // 等动画结束后再开模糊（抽屉动画约 250ms）。
+      _drawerBlurTimer = Timer(const Duration(milliseconds: 350), () {
+        if (mounted) setState(() => _drawerBlurOn = true);
+      });
+    } else {
+      if (mounted) setState(() => _drawerBlurOn = false);
+    }
   }
 
   void _refresh() {
@@ -719,10 +742,21 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
       child: Scaffold(
         key: _scaffoldKey,
         backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+        // 边缘滑出宽度默认 20px 偏窄（费力），36px 更易滑出；
+        // 不算太大，竖直滚动瀑布流时不易误触（Flutter 只识别边缘水平拖拽）。
+        drawerEdgeDragWidth: 36,
+        onDrawerChanged: _onDrawerChanged,
         drawer: Drawer(
-        child: Container(
-          color: Theme.of(context).colorScheme.surface,
-          child: ListView(
+          backgroundColor: Colors.transparent,
+          // 毛玻璃抽屉：模糊背后的主体页面（Drawer 是 overlay 层，BackdropFilter 有效）。
+          // 开合动画期间 forceDisable 降级为纯半透明，动画结束恢复模糊，
+          // 避免动画期每帧重采样背景导致掉帧。
+          child: GlassContainer(
+            tint: Theme.of(context).colorScheme.surface,
+            tintOpacity: 0.45,
+            borderRadius: BorderRadius.zero,
+            forceDisable: !_drawerBlurOn,
+            child: ListView(
             padding: EdgeInsets.zero,
             children: [
               _buildDrawerHeader(account),
@@ -832,6 +866,186 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
     ));
   }
 
+  /// 主界面顶部毛玻璃搜索栏。
+  /// 必须作为 Stack 浮层绘制在列表**之上**（先画列表、后画搜索栏），
+  /// `BackdropFilter` 才能采样到滚动中的画廊内容；放在 SliverAppBar
+  /// 里会因 sliver 先于 body 绘制而永远模糊不到东西。
+  Widget _buildHomeSearchBar(BuildContext context) {
+    return GlassContainer(
+      height: 52,
+      borderRadius: BorderRadius.circular(26),
+      tintOpacity: 0.25,
+      child: Row(
+        children: [
+          IconButton(
+            icon: Icon(Icons.menu, color: Theme.of(context).iconTheme.color),
+            onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+          ),
+          Expanded(
+            child: RawAutocomplete<SearchSuggestion>(
+              textEditingController: _searchController,
+              focusNode: _searchFocusNode,
+              displayStringForOption: (SearchSuggestion option) => option.text,
+              optionsBuilder: (TextEditingValue textEditingValue) async {
+                final text = textEditingValue.text.trimLeft();
+                final history = ref.read(searchProvider).history;
+
+                List<SearchSuggestion> suggestions = [];
+
+                if (text.isNotEmpty) {
+                  try {
+                    final lastWord = text.split(RegExp(r'\s+')).last;
+                    if (lastWord.length >= 2) {
+                      if (RegExp(r'[\u4e00-\u9fff]').hasMatch(lastWord)) {
+                        final matches = searchTagByChinese(keyword: lastWord);
+                        suggestions
+                            .addAll(matches.map((m) => SearchSuggestion(m.raw, false, subtitle: m.translated)));
+                      }
+                      final res = await fetchAutocomplete(prefix: lastWord);
+                      final json = jsonDecode(res) as Map;
+                      if (json.containsKey('tags')) {
+                        final tags = json['tags'];
+                        if (tags is List) {
+                          suggestions.addAll(tags.map((e) => SearchSuggestion(e.toString(), false)));
+                        } else if (tags is Map) {
+                          suggestions.addAll(tags.values.map((e) {
+                            if (e is Map && e.containsKey('ns') && e.containsKey('tn')) {
+                              return SearchSuggestion("${e['ns']}:${e['tn']}", false);
+                            }
+                            return SearchSuggestion(e.toString(), false);
+                          }));
+                        }
+                      }
+                    }
+                  } catch (_) {}
+                }
+
+                if (text.isEmpty) {
+                  suggestions.addAll(history.map((h) => SearchSuggestion(h, true)));
+                } else {
+                  suggestions.addAll(history
+                      .where((h) => h.toLowerCase().contains(text.toLowerCase()))
+                      .map((h) => SearchSuggestion(h, true)));
+                }
+
+                final unique = <String, SearchSuggestion>{};
+                for (var s in suggestions) {
+                  if (!unique.containsKey(s.text)) unique[s.text] = s;
+                }
+                return unique.values.toList();
+              },
+              onSelected: (SearchSuggestion selection) {
+                if (selection.isHistory) {
+                  _searchController.text = selection.text;
+                } else {
+                  final text = _searchController.text;
+                  final words = text.split(RegExp(r'\s+'));
+                  if (words.isNotEmpty) {
+                    words.removeLast();
+                    words.add(selection.text);
+                    _searchController.text = '${words.join(' ')} ';
+                  } else {
+                    _searchController.text = '${selection.text} ';
+                  }
+                }
+                _searchFocusNode.unfocus();
+                _refresh();
+              },
+              fieldViewBuilder: (BuildContext context, TextEditingController textEditingController,
+                  FocusNode focusNode, VoidCallback onFieldSubmitted) {
+                return TextField(
+                  controller: textEditingController,
+                  focusNode: focusNode,
+                  style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color, fontSize: 17),
+                  decoration: InputDecoration(
+                    hintText: '搜索画廊...',
+                    hintStyle: TextStyle(color: Theme.of(context).textTheme.bodyMedium?.color, fontSize: 17),
+                    border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 16),
+                  ),
+                  onSubmitted: (_) {
+                    onFieldSubmitted();
+                    _refresh();
+                  },
+                );
+              },
+              optionsViewBuilder: (BuildContext context, AutocompleteOnSelected<SearchSuggestion> onSelected,
+                  Iterable<SearchSuggestion> options) {
+                return Align(
+                  alignment: Alignment.topLeft,
+                  // 建议列表也做毛玻璃（overlay 浮层，BackdropFilter 有效）。
+                  child: GlassContainer(
+                    tintOpacity: 0.5,
+                    borderRadius: BorderRadius.circular(12),
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                          maxHeight: 280, maxWidth: MediaQuery.of(context).size.width - 64),
+                      child: ListView.builder(
+                        padding: EdgeInsets.zero,
+                        shrinkWrap: true,
+                        itemCount: options.length,
+                        itemBuilder: (BuildContext context, int index) {
+                          final SearchSuggestion option = options.elementAt(index);
+                          return InkWell(
+                            onTap: () => onSelected(option),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 12.0, horizontal: 16.0),
+                              child: Row(
+                                children: [
+                                  Icon(option.isHistory ? Icons.history : Icons.local_offer_outlined,
+                                      color: Theme.of(context).iconTheme.color?.withOpacity(0.5),
+                                      size: 18),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(option.text,
+                                            style: TextStyle(
+                                                color: Theme.of(context).textTheme.bodyLarge?.color)),
+                                        if (option.subtitle.isNotEmpty)
+                                          Text(option.subtitle,
+                                              style: TextStyle(
+                                                  color: Theme.of(context)
+                                                      .textTheme
+                                                      .bodyMedium
+                                                      ?.color
+                                                      ?.withOpacity(0.6),
+                                                  fontSize: 12)),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          if (_searchController.text.isNotEmpty)
+            IconButton(
+              icon: Icon(Icons.clear, color: Theme.of(context).iconTheme.color?.withOpacity(0.5), size: 20),
+              onPressed: () {
+                _searchController.clear();
+                _refresh();
+              },
+            ),
+          IconButton(
+            icon: Icon(Icons.search, color: Theme.of(context).iconTheme.color),
+            onPressed: _refresh,
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildHomeView(BuildContext context, AccountInfo account, List<HomeTab> tabs) {
     return Stack(
       children: [
@@ -844,7 +1058,7 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
             physics: const AlwaysScrollableScrollPhysics(),
             floatHeaderSlivers: true,
             headerSliverBuilder: (context, innerBoxIsScrolled) => [
-              SliverSafeArea(
+              const SliverSafeArea(
                 bottom: false,
                 sliver: SliverAppBar(
                   floating: true,
@@ -853,180 +1067,23 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
                   elevation: 0,
                   toolbarHeight: 84,
                   automaticallyImplyLeading: false,
-                  title: Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: Container(
-                    height: 52,
-                    decoration: BoxDecoration(
-                      color: searchFieldColor(context),
-                      borderRadius: BorderRadius.circular(26),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Theme.of(context).brightness == Brightness.dark ? Colors.black45 : Colors.black12, 
-                          blurRadius: 10, 
-                          offset: const Offset(0, 4)
-                        )
-                      ]
-                    ),
-                    child: Row(
-                      children: [
-                        IconButton(
-                          icon: Icon(Icons.menu, color: Theme.of(context).iconTheme.color),
-                          onPressed: () => _scaffoldKey.currentState?.openDrawer(),
-                        ),
-                        Expanded(
-                          child: RawAutocomplete<SearchSuggestion>(
-                            textEditingController: _searchController,
-                            focusNode: _searchFocusNode,
-                            displayStringForOption: (SearchSuggestion option) => option.text,
-                            optionsBuilder: (TextEditingValue textEditingValue) async {
-                              final text = textEditingValue.text.trimLeft();
-                              final history = ref.read(searchProvider).history;
-                              
-                              List<SearchSuggestion> suggestions = [];
-                              
-                              if (text.isNotEmpty) {
-                                try {
-                                  final lastWord = text.split(RegExp(r'\s+')).last;
-                                  if (lastWord.length >= 2) {
-                                    if (RegExp(r'[\u4e00-\u9fff]').hasMatch(lastWord)) {
-                                      final matches = searchTagByChinese(keyword: lastWord);
-                                      suggestions.addAll(matches.map((m) => SearchSuggestion(m.raw, false, subtitle: m.translated)));
-                                    }
-                                    final res = await fetchAutocomplete(prefix: lastWord);
-                                    final json = jsonDecode(res) as Map;
-                                    if (json.containsKey('tags')) {
-                                      final tags = json['tags'];
-                                      if (tags is List) {
-                                        suggestions.addAll(tags.map((e) => SearchSuggestion(e.toString(), false)));
-                                      } else if (tags is Map) {
-                                        suggestions.addAll(tags.values.map((e) {
-                                          if (e is Map && e.containsKey('ns') && e.containsKey('tn')) {
-                                            return SearchSuggestion("${e['ns']}:${e['tn']}", false);
-                                          }
-                                          return SearchSuggestion(e.toString(), false);
-                                        }));
-                                      }
-                                    }
-                                  }
-                                } catch (_) {}
-                              }
-                              
-                              if (text.isEmpty) {
-                                suggestions.addAll(history.map((h) => SearchSuggestion(h, true)));
-                              } else {
-                                suggestions.addAll(history.where((h) => h.toLowerCase().contains(text.toLowerCase())).map((h) => SearchSuggestion(h, true)));
-                              }
-                              
-                              final unique = <String, SearchSuggestion>{};
-                              for (var s in suggestions) {
-                                if (!unique.containsKey(s.text)) unique[s.text] = s;
-                              }
-                              return unique.values.toList();
-                            },
-                            onSelected: (SearchSuggestion selection) {
-                              if (selection.isHistory) {
-                                _searchController.text = selection.text;
-                              } else {
-                                final text = _searchController.text;
-                                final words = text.split(RegExp(r'\s+'));
-                                if (words.isNotEmpty) {
-                                  words.removeLast();
-                                  words.add(selection.text);
-                                  _searchController.text = '${words.join(' ')} ';
-                                } else {
-                                  _searchController.text = '${selection.text} ';
-                                }
-                              }
-                              _searchFocusNode.unfocus();
-                              _refresh();
-                            },
-                            fieldViewBuilder: (BuildContext context, TextEditingController textEditingController, FocusNode focusNode, VoidCallback onFieldSubmitted) {
-                              return TextField(
-                                controller: textEditingController,
-                                focusNode: focusNode,
-                                style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color, fontSize: 17),
-                                decoration: InputDecoration(
-                                  hintText: '搜索画廊...',
-                                  hintStyle: TextStyle(color: Theme.of(context).textTheme.bodyMedium?.color, fontSize: 17),
-                                  border: InputBorder.none,
-                                  isDense: true,
-                                  contentPadding: const EdgeInsets.symmetric(vertical: 16),
-                                ),
-                                onSubmitted: (_) {
-                                  onFieldSubmitted();
-                                  _refresh();
-                                },
-                              );
-                            },
-                            optionsViewBuilder: (BuildContext context, AutocompleteOnSelected<SearchSuggestion> onSelected, Iterable<SearchSuggestion> options) {
-                              return Align(
-                                alignment: Alignment.topLeft,
-                                child: Material(
-                                  elevation: 4.0,
-                                  borderRadius: BorderRadius.circular(12),
-                                  color: Theme.of(context).colorScheme.surfaceContainer,
-                                  child: ConstrainedBox(
-                                    constraints: BoxConstraints(maxHeight: 280, maxWidth: MediaQuery.of(context).size.width - 120),
-                                    child: ListView.builder(
-                                      padding: EdgeInsets.zero,
-                                      shrinkWrap: true,
-                                      itemCount: options.length,
-                                      itemBuilder: (BuildContext context, int index) {
-                                        final SearchSuggestion option = options.elementAt(index);
-                                        return InkWell(
-                                          onTap: () => onSelected(option),
-                                          child: Padding(
-                                            padding: const EdgeInsets.symmetric(vertical: 12.0, horizontal: 16.0),
-                                            child: Row(
-                                              children: [
-                                                Icon(option.isHistory ? Icons.history : Icons.local_offer_outlined, color: Theme.of(context).iconTheme.color?.withOpacity(0.5), size: 18),
-                                                const SizedBox(width: 8),
-                                                Expanded(
-                                                  child: Column(
-                                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                                    mainAxisSize: MainAxisSize.min,
-                                                    children: [
-                                                      Text(option.text, style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color)),
-                                                      if (option.subtitle.isNotEmpty)
-                                                        Text(option.subtitle, style: TextStyle(color: Theme.of(context).textTheme.bodyMedium?.color?.withOpacity(0.6), fontSize: 12)),
-                                                    ],
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        );
-                                      },
-                                    ),
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                        if (_searchController.text.isNotEmpty)
-                          IconButton(
-                            icon: Icon(Icons.clear, color: Theme.of(context).iconTheme.color?.withOpacity(0.5), size: 20),
-                            onPressed: () {
-                              _searchController.clear();
-                              _refresh();
-                            },
-                          ),
-                        IconButton(
-                          icon: Icon(Icons.search, color: Theme.of(context).iconTheme.color),
-                          onPressed: _refresh,
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
+                  // 搜索栏已移出 SliverAppBar，作为 Stack 浮层绘制在列表之上，
+                  // 这样 BackdropFilter 才能采样到滚动内容（见 _buildHomeSearchBar）。
+                  title: SizedBox.shrink(),
                 ),
               ),
             ],
             body: _buildHomeBody(tabs),
           ),
           ),
+        // 顶部毛玻璃搜索栏：必须绘制在列表之后（Stack 上层），
+        // 否则 SliverAppBar 中的 BackdropFilter 因 sliver 绘制顺序采样不到 body。
+        Positioned(
+          top: MediaQuery.of(context).padding.top + 8,
+          left: 16,
+          right: 16,
+          child: _buildHomeSearchBar(context),
+        ),
         if (_showTabIndicator && tabs.isNotEmpty)
           Positioned(
             top: MediaQuery.of(context).padding.top + 120,
@@ -1039,13 +1096,19 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
                     decoration: BoxDecoration(
-                      color: const Color(0xFFE94560).withOpacity(0.95),
+                      // 跟随主题强调色，不再硬编码玫红。
+                      color: Theme.of(context).colorScheme.primary,
                       borderRadius: BorderRadius.circular(24),
                       boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 4))]
                     ),
                     child: Text(
                       _currentTabIndex < tabs.length ? tabs[_currentTabIndex].name : '',
-                      style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 1.0),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onPrimary,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
                     ),
                   ),
                 ),
@@ -1217,16 +1280,211 @@ class _CustomListViewState extends ConsumerState<CustomListView> {
     _loadInitial();
   }
 
+  /// 搜索结果页顶部毛玻璃搜索栏（Stack 浮层，绘制在列表之上，
+  /// BackdropFilter 才能采样到滚动内容；放 SliverAppBar 内会因
+  /// sliver 先于 body 绘制而无法模糊）。
+  Widget _buildCustomSearchBar(BuildContext context) {
+    return GlassContainer(
+      height: 52,
+      borderRadius: BorderRadius.circular(26),
+      tintOpacity: 0.25,
+      child: Row(
+        children: [
+          widget.standalone
+              ? IconButton(
+                  icon: const Icon(Icons.arrow_back),
+                  onPressed: () => Navigator.maybePop(context),
+                )
+              : (widget.showMenu
+                  ? IconButton(
+                      icon: Icon(Icons.menu, color: Theme.of(context).iconTheme.color),
+                      onPressed: () => Scaffold.of(context).openDrawer(),
+                    )
+                  : const SizedBox.shrink()),
+          Expanded(
+            child: widget.path.startsWith('toplist.php')
+                ? Text(widget.title,
+                    style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color, fontSize: 16))
+                : RawAutocomplete<SearchSuggestion>(
+                    textEditingController: _searchController,
+                    focusNode: _searchFocusNode,
+                    displayStringForOption: (SearchSuggestion option) => option.text,
+                    optionsBuilder: (TextEditingValue textEditingValue) async {
+                      final text = textEditingValue.text.trimLeft();
+                      final history = ref.read(searchProvider).history;
+
+                      List<SearchSuggestion> suggestions = [];
+
+                      if (text.isNotEmpty) {
+                        try {
+                          final lastWord = text.split(RegExp(r'\s+')).last;
+                          if (lastWord.length >= 2) {
+                            if (RegExp(r'[\u4e00-\u9fff]').hasMatch(lastWord)) {
+                              final matches = searchTagByChinese(keyword: lastWord);
+                              suggestions.addAll(
+                                  matches.map((m) => SearchSuggestion(m.raw, false, subtitle: m.translated)));
+                            }
+                            final res = await fetchAutocomplete(prefix: lastWord);
+                            final json = jsonDecode(res) as Map;
+                            if (json.containsKey('tags')) {
+                              final tags = json['tags'];
+                              if (tags is List) {
+                                suggestions.addAll(tags.map((e) => SearchSuggestion(e.toString(), false)));
+                              } else if (tags is Map) {
+                                suggestions.addAll(tags.keys.map((e) => SearchSuggestion(e.toString(), false)));
+                              }
+                            }
+                          }
+                        } catch (_) {}
+                      }
+
+                      if (text.isEmpty) {
+                        suggestions.addAll(history.map((h) => SearchSuggestion(h, true)));
+                      } else {
+                        suggestions.addAll(history
+                            .where((h) => h.toLowerCase().contains(text.toLowerCase()))
+                            .map((h) => SearchSuggestion(h, true)));
+                      }
+
+                      final unique = <String, SearchSuggestion>{};
+                      for (var s in suggestions) {
+                        if (!unique.containsKey(s.text)) unique[s.text] = s;
+                      }
+                      return unique.values.toList();
+                    },
+                    onSelected: (SearchSuggestion selection) {
+                      if (selection.isHistory) {
+                        _searchController.text = selection.text;
+                      } else {
+                        final text = _searchController.text;
+                        final words = text.split(RegExp(r'\s+'));
+                        if (words.isNotEmpty) {
+                          words.removeLast();
+                          words.add(selection.text);
+                          _searchController.text = '${words.join(' ')} ';
+                        } else {
+                          _searchController.text = '${selection.text} ';
+                        }
+                      }
+                      _searchFocusNode.unfocus();
+                      _refresh();
+                    },
+                    fieldViewBuilder: (BuildContext context, TextEditingController textEditingController,
+                        FocusNode focusNode, VoidCallback onFieldSubmitted) {
+                      return TextField(
+                        controller: textEditingController,
+                        focusNode: focusNode,
+                        style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color),
+                        decoration: InputDecoration(
+                          hintText: '在${widget.title}中搜索...',
+                          hintStyle: TextStyle(color: Theme.of(context).textTheme.bodyMedium?.color),
+                          border: InputBorder.none,
+                          isDense: true,
+                          contentPadding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                        onSubmitted: (_) {
+                          onFieldSubmitted();
+                          _refresh();
+                        },
+                      );
+                    },
+                    optionsViewBuilder: (BuildContext context, AutocompleteOnSelected<SearchSuggestion> onSelected,
+                        Iterable<SearchSuggestion> options) {
+                      return Align(
+                        alignment: Alignment.topLeft,
+                        // 建议列表也做毛玻璃（overlay 浮层，BackdropFilter 有效）。
+                        child: GlassContainer(
+                          tintOpacity: 0.5,
+                          borderRadius: BorderRadius.circular(12),
+                          child: ConstrainedBox(
+                            constraints:
+                                BoxConstraints(maxHeight: 250, maxWidth: MediaQuery.of(context).size.width - 64),
+                            child: ListView.builder(
+                              padding: EdgeInsets.zero,
+                              shrinkWrap: true,
+                              itemCount: options.length,
+                              itemBuilder: (BuildContext context, int index) {
+                                final SearchSuggestion option = options.elementAt(index);
+                                return InkWell(
+                                  onTap: () => onSelected(option),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(vertical: 12.0, horizontal: 16.0),
+                                    child: Row(
+                                      children: [
+                                        Icon(option.isHistory ? Icons.history : Icons.local_offer_outlined,
+                                            color: Theme.of(context).iconTheme.color?.withOpacity(0.5),
+                                            size: 18),
+                                        const SizedBox(width: 8),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Text(option.text,
+                                                  style: TextStyle(
+                                                      color: Theme.of(context).textTheme.bodyLarge?.color)),
+                                              if (option.subtitle.isNotEmpty)
+                                                Text(option.subtitle,
+                                                    style: TextStyle(
+                                                        color: Theme.of(context)
+                                                            .textTheme
+                                                            .bodyMedium
+                                                            ?.color
+                                                            ?.withOpacity(0.6),
+                                                        fontSize: 12)),
+                                            ],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          if (_searchController.text.isNotEmpty && !widget.path.startsWith('toplist.php'))
+            IconButton(
+              icon: Icon(Icons.clear, color: Theme.of(context).iconTheme.color?.withOpacity(0.5), size: 20),
+              onPressed: () {
+                _searchController.clear();
+                _refresh();
+              },
+            ),
+          if (_isRefreshing)
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 14.0),
+              child: SizedBox(
+                width: 20, height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFE94560)),
+              ),
+            )
+          else
+            IconButton(
+              icon: Icon(Icons.refresh, color: Theme.of(context).iconTheme.color),
+              onPressed: _refresh,
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return NotificationListener<UserScrollNotification>(
-      onNotification: (notification) {
-        FocusManager.instance.primaryFocus?.unfocus();
-        return false;
-      },
-      child: NestedScrollView(
+    final content = Stack(
+      children: [
+        NotificationListener<UserScrollNotification>(
+          onNotification: (notification) {
+            FocusManager.instance.primaryFocus?.unfocus();
+            return false;
+          },
+          child: NestedScrollView(
       headerSliverBuilder: (context, innerBoxIsScrolled) => [
-        SliverSafeArea(
+        const SliverSafeArea(
           bottom: false,
           sliver: SliverAppBar(
             floating: true,
@@ -1234,195 +1492,30 @@ class _CustomListViewState extends ConsumerState<CustomListView> {
             backgroundColor: Colors.transparent,
             elevation: 0,
             toolbarHeight: 84,
-            automaticallyImplyLeading: !widget.standalone,
-            leading: widget.standalone
-                ? IconButton(
-                    icon: const Icon(Icons.arrow_back),
-                    onPressed: () => Navigator.maybePop(context),
-                  )
-                : null,
-            title: Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Container(
-              height: 52,
-              decoration: BoxDecoration(
-                color: searchFieldColor(context),
-                borderRadius: BorderRadius.circular(26),
-                boxShadow: [
-                  BoxShadow(
-                    color: Theme.of(context).brightness == Brightness.dark ? Colors.black45 : Colors.black12, 
-                    blurRadius: 10, 
-                    offset: const Offset(0, 4)
-                  )
-                ]
-              ),
-              child: Row(
-                children: [
-                  widget.standalone || !widget.showMenu
-                      ? const SizedBox.shrink()
-                      : IconButton(
-                          icon: Icon(Icons.menu, color: Theme.of(context).iconTheme.color),
-                          onPressed: () => Scaffold.of(context).openDrawer(),
-                        ),
-                  Expanded(
-                    child: widget.path.startsWith('toplist.php')
-                      ? Text(widget.title, style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color, fontSize: 16))
-                      : RawAutocomplete<SearchSuggestion>(
-                            textEditingController: _searchController,
-                            focusNode: _searchFocusNode,
-                            displayStringForOption: (SearchSuggestion option) => option.text,
-                            optionsBuilder: (TextEditingValue textEditingValue) async {
-                              final text = textEditingValue.text.trimLeft();
-                              final history = ref.read(searchProvider).history;
-                              
-                              List<SearchSuggestion> suggestions = [];
-                              
-                              if (text.isNotEmpty) {
-                                try {
-                                  final lastWord = text.split(RegExp(r'\s+')).last;
-                                  if (lastWord.length >= 2) {
-                                    if (RegExp(r'[\u4e00-\u9fff]').hasMatch(lastWord)) {
-                                      final matches = searchTagByChinese(keyword: lastWord);
-                                      suggestions.addAll(matches.map((m) => SearchSuggestion(m.raw, false, subtitle: m.translated)));
-                                    }
-                                    final res = await fetchAutocomplete(prefix: lastWord);
-                                    final json = jsonDecode(res) as Map;
-                                    if (json.containsKey('tags')) {
-                                      final tags = json['tags'];
-                                      if (tags is List) {
-                                        suggestions.addAll(tags.map((e) => SearchSuggestion(e.toString(), false)));
-                                      } else if (tags is Map) {
-                                        suggestions.addAll(tags.keys.map((e) => SearchSuggestion(e.toString(), false)));
-                                      }
-                                    }
-                                  }
-                                } catch (_) {}
-                              }
-                              
-                              if (text.isEmpty) {
-                                suggestions.addAll(history.map((h) => SearchSuggestion(h, true)));
-                              } else {
-                                suggestions.addAll(history.where((h) => h.toLowerCase().contains(text.toLowerCase())).map((h) => SearchSuggestion(h, true)));
-                              }
-                              
-                              final unique = <String, SearchSuggestion>{};
-                              for (var s in suggestions) {
-                                if (!unique.containsKey(s.text)) unique[s.text] = s;
-                              }
-                              return unique.values.toList();
-                            },
-                            onSelected: (SearchSuggestion selection) {
-                              if (selection.isHistory) {
-                                _searchController.text = selection.text;
-                              } else {
-                                final text = _searchController.text;
-                                final words = text.split(RegExp(r'\s+'));
-                                if (words.isNotEmpty) {
-                                  words.removeLast();
-                                  words.add(selection.text);
-                                  _searchController.text = '${words.join(' ')} ';
-                                } else {
-                                  _searchController.text = '${selection.text} ';
-                                }
-                              }
-                              _searchFocusNode.unfocus();
-                              _refresh();
-                            },
-                            fieldViewBuilder: (BuildContext context, TextEditingController textEditingController, FocusNode focusNode, VoidCallback onFieldSubmitted) {
-                              return TextField(
-                                controller: textEditingController,
-                                focusNode: focusNode,
-                                style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color),
-                                decoration: InputDecoration(
-                                  hintText: '在${widget.title}中搜索...',
-                                  hintStyle: TextStyle(color: Theme.of(context).textTheme.bodyMedium?.color),
-                                  border: InputBorder.none,
-                                  isDense: true,
-                                  contentPadding: const EdgeInsets.symmetric(vertical: 14),
-                                ),
-                                onSubmitted: (_) {
-                                  onFieldSubmitted();
-                                  _refresh();
-                                },
-                              );
-                            },
-                            optionsViewBuilder: (BuildContext context, AutocompleteOnSelected<SearchSuggestion> onSelected, Iterable<SearchSuggestion> options) {
-                              return Align(
-                                alignment: Alignment.topLeft,
-                                child: Material(
-                                  elevation: 4.0,
-                                  borderRadius: BorderRadius.circular(12),
-                                  color: Theme.of(context).colorScheme.surfaceContainer,
-                                  child: ConstrainedBox(
-                                    constraints: const BoxConstraints(maxHeight: 250, maxWidth: 300),
-                                    child: ListView.builder(
-                                      padding: EdgeInsets.zero,
-                                      shrinkWrap: true,
-                                      itemCount: options.length,
-                                      itemBuilder: (BuildContext context, int index) {
-                                        final SearchSuggestion option = options.elementAt(index);
-                                        return InkWell(
-                                          onTap: () => onSelected(option),
-                                          child: Padding(
-                                            padding: const EdgeInsets.symmetric(vertical: 12.0, horizontal: 16.0),
-                                            child: Row(
-                                              children: [
-                                                Icon(option.isHistory ? Icons.history : Icons.local_offer_outlined, color: Theme.of(context).iconTheme.color?.withOpacity(0.5), size: 18),
-                                                const SizedBox(width: 8),
-                                                Expanded(
-                                                  child: Column(
-                                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                                    mainAxisSize: MainAxisSize.min,
-                                                    children: [
-                                                      Text(option.text, style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color)),
-                                                      if (option.subtitle.isNotEmpty)
-                                                        Text(option.subtitle, style: TextStyle(color: Theme.of(context).textTheme.bodyMedium?.color?.withOpacity(0.6), fontSize: 12)),
-                                                    ],
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        );
-                                      },
-                                    ),
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                  ),
-                  if (_searchController.text.isNotEmpty && !widget.path.startsWith('toplist.php'))
-                    IconButton(
-                      icon: Icon(Icons.clear, color: Theme.of(context).iconTheme.color?.withOpacity(0.5), size: 20),
-                      onPressed: () {
-                        _searchController.clear();
-                        _refresh();
-                      },
-                    ),
-                  if (_isRefreshing)
-                    const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 14.0),
-                      child: SizedBox(
-                        width: 20, height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFE94560)),
-                      ),
-                    )
-                  else
-                    IconButton(
-                      icon: Icon(Icons.refresh, color: Theme.of(context).iconTheme.color),
-                      onPressed: _refresh,
-                    ),
-                ],
-              ),
-            ),
-            ),
+            automaticallyImplyLeading: false,
+            title: SizedBox.shrink(),
           ),
         ),
       ],
-      body: _buildCustomListBody(),
-    ),
+          body: _buildCustomListBody(),
+        ),
+        ),
+        // 顶部毛玻璃搜索栏（浮层绘制在列表之上，BackdropFilter 才能生效）
+        Positioned(
+          top: MediaQuery.of(context).padding.top + 8,
+          left: 16,
+          right: 16,
+          child: _buildCustomSearchBar(context),
+        ),
+      ],
     );
+    // 独立页面（如详情页点标签进入的搜索结果页）经 MaterialPageRoute 推入，
+    // 自身没有 Scaffold，文本样式链不完整。补上 Scaffold 提供正确的
+    // Material/DefaultTextStyle 祖先。嵌入到其它页面的用法保持不变。
+    if (widget.standalone) {
+      return Scaffold(body: content);
+    }
+    return content;
   }
 
   Widget _buildCustomListBody() {
@@ -1592,6 +1685,97 @@ class _HistoryViewState extends ConsumerState<HistoryView> {
     return '${t.month}月${t.day}日';
   }
 
+  /// 历史页顶部毛玻璃搜索栏（Stack 浮层，绘制在列表之上，BackdropFilter 才能生效）。
+  Widget _buildHistorySearchBar(BuildContext context) {
+    final history = ref.watch(historyProvider);
+    return GlassContainer(
+      height: 52,
+      borderRadius: BorderRadius.circular(26),
+      tintOpacity: 0.25,
+      child: _selectionMode
+          ? Row(
+              children: [
+                IconButton(
+                  icon: Icon(Icons.close, color: Theme.of(context).iconTheme.color),
+                  onPressed: _exitSelection,
+                ),
+                Expanded(
+                  child: Text(
+                    '已选 ${_selected.length} 项',
+                    style: TextStyle(
+                      color: Theme.of(context).textTheme.bodyLarge?.color,
+                      fontSize: 16,
+                    ),
+                  ),
+                ),
+                if (_selected.isNotEmpty)
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline, color: Color(0xFFE94560)),
+                    onPressed: _confirmBatchRemove,
+                  ),
+              ],
+            )
+          : Row(
+              children: [
+                IconButton(
+                  icon: Icon(Icons.menu, color: Theme.of(context).iconTheme.color),
+                  onPressed: () => Scaffold.of(context).openDrawer(),
+                ),
+                Expanded(
+                  child: TextField(
+                    controller: _searchController,
+                    focusNode: _searchFocusNode,
+                    style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color, fontSize: 17),
+                    decoration: InputDecoration(
+                      hintText: '搜索历史...',
+                      hintStyle: TextStyle(color: Theme.of(context).textTheme.bodyMedium?.color, fontSize: 17),
+                      border: InputBorder.none,
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(vertical: 16),
+                      prefixIcon: Icon(Icons.search, size: 20, color: Theme.of(context).iconTheme.color?.withOpacity(0.5)),
+                      suffixIcon: _query.isNotEmpty
+                          ? IconButton(
+                              icon: Icon(Icons.clear, size: 18, color: Theme.of(context).iconTheme.color?.withOpacity(0.5)),
+                              onPressed: () {
+                                _searchController.clear();
+                                _searchFocusNode.unfocus();
+                                setState(() => _query = '');
+                              },
+                            )
+                          : null,
+                    ),
+                    onChanged: (val) => setState(() => _query = val),
+                  ),
+                ),
+                if (history.isNotEmpty)
+                  IconButton(
+                    icon: Icon(Icons.delete_outline, color: Theme.of(context).iconTheme.color?.withOpacity(0.6)),
+                    onPressed: () {
+                      showDialog(
+                        context: context,
+                        builder: (ctx) => AlertDialog(
+                          title: const Text('清除历史记录'),
+                          content: const Text('确定要清除所有本地浏览历史吗？'),
+                          actions: [
+                            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+                            ElevatedButton(
+                              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE94560)),
+                              onPressed: () {
+                                ref.read(historyProvider.notifier).clearHistory();
+                                Navigator.pop(ctx);
+                              },
+                              child: const Text('清除'),
+                            )
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+              ],
+            ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final history = ref.watch(historyProvider);
@@ -1602,14 +1786,16 @@ class _HistoryViewState extends ConsumerState<HistoryView> {
             .where((e) => e.item.title.toLowerCase().contains(query))
             .toList();
 
-    return NotificationListener<UserScrollNotification>(
-      onNotification: (notification) {
-        FocusManager.instance.primaryFocus?.unfocus();
-        return false;
-      },
-      child: NestedScrollView(
+    return Stack(
+      children: [
+        NotificationListener<UserScrollNotification>(
+          onNotification: (notification) {
+            FocusManager.instance.primaryFocus?.unfocus();
+            return false;
+          },
+          child: NestedScrollView(
       headerSliverBuilder: (context, innerBoxIsScrolled) => [
-        SliverSafeArea(
+        const SliverSafeArea(
           bottom: false,
           sliver: SliverAppBar(
             floating: true,
@@ -1618,95 +1804,7 @@ class _HistoryViewState extends ConsumerState<HistoryView> {
             elevation: 0,
             toolbarHeight: 72,
             automaticallyImplyLeading: false,
-            title: Container(
-              height: 52,
-              decoration: BoxDecoration(
-                color: searchFieldColor(context),
-                borderRadius: BorderRadius.circular(26),
-                boxShadow: const [BoxShadow(color: Colors.black45, blurRadius: 10, offset: Offset(0, 4))]
-              ),
-              child: _selectionMode
-                  ? Row(
-                      children: [
-                        IconButton(
-                          icon: Icon(Icons.close, color: Theme.of(context).iconTheme.color),
-                          onPressed: _exitSelection,
-                        ),
-                        Expanded(
-                          child: Text(
-                            '已选 ${_selected.length} 项',
-                            style: TextStyle(
-                              color: Theme.of(context).textTheme.bodyLarge?.color,
-                              fontSize: 16,
-                            ),
-                          ),
-                        ),
-                        if (_selected.isNotEmpty)
-                          IconButton(
-                            icon: const Icon(Icons.delete_outline, color: Color(0xFFE94560)),
-                            onPressed: _confirmBatchRemove,
-                          ),
-                      ],
-                    )
-                  : Row(
-                      children: [
-                        IconButton(
-                          icon: Icon(Icons.menu, color: Theme.of(context).iconTheme.color),
-                          onPressed: () => Scaffold.of(context).openDrawer(),
-                        ),
-                        Expanded(
-                          child: TextField(
-                            controller: _searchController,
-                            focusNode: _searchFocusNode,
-                            style: TextStyle(color: Theme.of(context).textTheme.bodyLarge?.color, fontSize: 17),
-                            decoration: InputDecoration(
-                              hintText: '搜索历史...',
-                              hintStyle: TextStyle(color: Theme.of(context).textTheme.bodyMedium?.color, fontSize: 17),
-                              border: InputBorder.none,
-                              isDense: true,
-                              contentPadding: const EdgeInsets.symmetric(vertical: 16),
-                              prefixIcon: Icon(Icons.search, size: 20, color: Theme.of(context).iconTheme.color?.withOpacity(0.5)),
-                              suffixIcon: _query.isNotEmpty
-                                  ? IconButton(
-                                      icon: Icon(Icons.clear, size: 18, color: Theme.of(context).iconTheme.color?.withOpacity(0.5)),
-                                      onPressed: () {
-                                        _searchController.clear();
-                                        _searchFocusNode.unfocus();
-                                        setState(() => _query = '');
-                                      },
-                                    )
-                                  : null,
-                            ),
-                            onChanged: (val) => setState(() => _query = val),
-                          ),
-                        ),
-                        if (history.isNotEmpty)
-                          IconButton(
-                            icon: Icon(Icons.delete_outline, color: Theme.of(context).iconTheme.color?.withOpacity(0.6)),
-                            onPressed: () {
-                              showDialog(
-                                context: context,
-                                builder: (ctx) => AlertDialog(
-                                  title: const Text('清除历史记录'),
-                                  content: const Text('确定要清除所有本地浏览历史吗？'),
-                                  actions: [
-                                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-                                    ElevatedButton(
-                                      style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE94560)),
-                                      onPressed: () {
-                                        ref.read(historyProvider.notifier).clearHistory();
-                                        Navigator.pop(ctx);
-                                      },
-                                      child: const Text('清除'),
-                                    )
-                                  ],
-                                ),
-                              );
-                            },
-                          ),
-                      ],
-                    ),
-            ),
+            title: SizedBox.shrink(),
           ),
         ),
       ],
@@ -1821,7 +1919,16 @@ class _HistoryViewState extends ConsumerState<HistoryView> {
               ),
             ],
           ),
-    ),
+        ),
+        ),
+        // 顶部毛玻璃搜索栏（Stack 浮层）
+        Positioned(
+          top: MediaQuery.of(context).padding.top + 8,
+          left: 16,
+          right: 16,
+          child: _buildHistorySearchBar(context),
+        ),
+      ],
     );
   }
 }

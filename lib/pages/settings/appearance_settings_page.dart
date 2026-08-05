@@ -12,7 +12,9 @@ class AppearanceSettingsPage extends ConsumerWidget {
     final colorScheme = theme.colorScheme;
 
     return Scaffold(
-      backgroundColor: colorScheme.surfaceContainerLowest.withOpacity(0.95),
+      // 与其它设置页一致：跟随主题的 scaffold 背景，
+      // 而不是硬编码半透明 surfaceContainerLowest（导致主题色覆盖不到位）。
+      backgroundColor: theme.scaffoldBackgroundColor,
       appBar: AppBar(
         title: Text('样式设置',
             style: TextStyle(color: colorScheme.onSurface)),
@@ -45,6 +47,16 @@ class AppearanceSettingsPage extends ConsumerWidget {
             value: appearance.pixelShift, 
             onChanged: (val) {
               ref.read(appearanceProvider.notifier).setPixelShift(val);
+            },
+          ),
+          SwitchListTile(
+            title: Text('毛玻璃效果',
+                style: TextStyle(color: colorScheme.onSurface)),
+            subtitle: Text('搜索栏、阅读器浮层等使用半透明磨砂玻璃质感（Glassmorphism），关闭则恢复纯色',
+                style: TextStyle(color: colorScheme.onSurface.withOpacity(0.6))),
+            value: appearance.glassEffect,
+            onChanged: (val) {
+              ref.read(appearanceProvider.notifier).setGlassEffect(val);
             },
           ),
           SwitchListTile(

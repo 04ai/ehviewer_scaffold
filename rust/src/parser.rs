@@ -33,10 +33,18 @@ pub struct GalleryComment {
     pub author: String,
     pub time: String,
     pub content: String,
+    /// E-Hentai comment id (from `<div class="c1" id="c_123456">`), 0 when absent.
+    pub id: u64,
+    /// Comment vote score (upvotes - downvotes), 0 when unavailable.
+    pub score: i32,
+    /// Vote link parsed from the detail page HTML (`...act=vote&comment_id=...&vote=1`).
+    /// Relative URLs are completed against the site URL at vote time.
+    pub vote_url: String,
 }
 
 /// Parse gallery comments from a detail-page HTML document
-/// (structure: #cdiv > div.c1 > div.c3 [meta] + div.c6 [content]).
+/// (structure: #cdiv > div.c1 [id="c_<n>"] > div.c3 [meta] + div.c6 [content],
+/// plus optional vote links / score spans).
 pub fn parse_comments(html: &str) -> Vec<GalleryComment> {
     let document = Html::parse_document(html);
     let mut comments = Vec::new();
@@ -44,8 +52,18 @@ pub fn parse_comments(html: &str) -> Vec<GalleryComment> {
     let c3_sel = Selector::parse("div.c3").unwrap();
     let c6_sel = Selector::parse("div.c6").unwrap();
     let author_sel = Selector::parse("a").unwrap();
+    let vote_sel = Selector::parse("a[href*='act=vote']").unwrap();
+    let score_sel = Selector::parse("span[id*='comment_score'], span.score, span#score").unwrap();
 
     for c1 in document.select(&c1_sel) {
+        // Comment id: <div class="c1" id="c_123456">
+        let mut cid: u64 = 0;
+        if let Some(id_attr) = c1.value().attr("id") {
+            if let Some(rest) = id_attr.strip_prefix("c_") {
+                cid = rest.parse().unwrap_or(0);
+            }
+        }
+
         if let Some(c3) = c1.select(&c3_sel).next() {
             let c3_text = c3.text().collect::<String>();
             let mut time = String::new();
@@ -61,7 +79,33 @@ pub fn parse_comments(html: &str) -> Vec<GalleryComment> {
             if let Some(c6) = c1.select(&c6_sel).next() {
                 let content = c6.text().collect::<String>().trim().to_string();
                 if !author.is_empty() {
-                    comments.push(GalleryComment { author, time, content });
+                    // Vote link (first one; it encodes vote=1 for like).
+                    let vote_url = c1.select(&vote_sel).next()
+                        .and_then(|el| el.value().attr("href"))
+                        .unwrap_or("")
+                        .to_string();
+                    // Score: prefer a dedicated span, fall back to a signed number
+                    // in the vote area.
+                    let mut score: i32 = 0;
+                    if let Some(s) = c1.select(&score_sel).next() {
+                        let t = s.text().collect::<String>().trim().to_string();
+                        score = t.parse().unwrap_or(0);
+                    }
+                    if score == 0 {
+                        // Fall back to a signed number token in the comment text
+                        // (e.g. "±12" / "-3" next to the vote links).
+                        let c1_text = c1.text().collect::<String>();
+                        for tok in c1_text.split_whitespace() {
+                            let cleaned = tok.trim_matches(|c: char| !c.is_ascii_digit() && c != '-' && c != '+');
+                            if let Ok(v) = cleaned.parse::<i32>() {
+                                if v.abs() <= 1_000_000 {
+                                    score = v;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    comments.push(GalleryComment { author, time, content, id: cid, score, vote_url });
                 }
             }
         }

@@ -344,7 +344,10 @@ class _DownloadsPageState extends State<DownloadsPage> {
               ],
       ),
       body: _tasks.isEmpty
-          ? const Center(child: Text('当前没有下载任务', style: TextStyle(color: Colors.black54)))
+          ? Center(
+              child: Text('当前没有下载任务',
+                  style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6))))
           : ListView.builder(
               itemCount: _tasks.length,
               itemBuilder: (context, index) {

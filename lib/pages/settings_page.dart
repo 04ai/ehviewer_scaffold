@@ -344,18 +344,19 @@ class _SegmentButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     return GestureDetector(
       onTap: onTap,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12),
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: isSelected ? Colors.white : Colors.transparent,
+          color: isSelected ? colorScheme.surface : Colors.transparent,
           borderRadius: BorderRadius.circular(6),
           boxShadow: isSelected
               ? [
                   BoxShadow(
-                    color: Colors.black.withOpacity(0.04),
+                    color: colorScheme.shadow.withOpacity(0.04),
                     blurRadius: 2,
                     offset: const Offset(0, 1),
                   )
@@ -367,7 +368,9 @@ class _SegmentButton extends StatelessWidget {
           style: TextStyle(
             fontSize: 13,
             fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
-            color: isSelected ? Colors.black87 : Colors.black54,
+            color: isSelected
+                ? colorScheme.onSurface
+                : colorScheme.onSurface.withOpacity(0.6),
           ),
         ),
       ),

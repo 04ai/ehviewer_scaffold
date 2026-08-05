@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 838127887;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1671527229;
 
 // Section: executor
 
@@ -1259,6 +1259,42 @@ fn wire__crate__api__translate_tag_sync_impl(
         },
     )
 }
+fn wire__crate__api__vote_comment_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vote_comment",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_url = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let output_ok = crate::api::vote_comment(api_url).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__vote_gallery_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -1403,10 +1439,16 @@ impl SseDecode for crate::parser::GalleryComment {
         let mut var_author = <String>::sse_decode(deserializer);
         let mut var_time = <String>::sse_decode(deserializer);
         let mut var_content = <String>::sse_decode(deserializer);
+        let mut var_id = <u64>::sse_decode(deserializer);
+        let mut var_score = <i32>::sse_decode(deserializer);
+        let mut var_voteUrl = <String>::sse_decode(deserializer);
         return crate::parser::GalleryComment {
             author: var_author,
             time: var_time,
             content: var_content,
+            id: var_id,
+            score: var_score,
+            vote_url: var_voteUrl,
         };
     }
 }
@@ -1811,7 +1853,8 @@ fn pde_ffi_dispatcher_primary_impl(
         29 => wire__crate__api__set_site_url_impl(port, ptr, rust_vec_len, data_len),
         30 => wire__crate__api__start_download_impl(port, ptr, rust_vec_len, data_len),
         31 => wire__crate__api__sync_cookies_impl(port, ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__vote_gallery_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__vote_comment_impl(port, ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__vote_gallery_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1865,6 +1908,9 @@ impl flutter_rust_bridge::IntoDart for crate::parser::GalleryComment {
             self.author.into_into_dart().into_dart(),
             self.time.into_into_dart().into_dart(),
             self.content.into_into_dart().into_dart(),
+            self.id.into_into_dart().into_dart(),
+            self.score.into_into_dart().into_dart(),
+            self.vote_url.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -2097,6 +2143,9 @@ impl SseEncode for crate::parser::GalleryComment {
         <String>::sse_encode(self.author, serializer);
         <String>::sse_encode(self.time, serializer);
         <String>::sse_encode(self.content, serializer);
+        <u64>::sse_encode(self.id, serializer);
+        <i32>::sse_encode(self.score, serializer);
+        <String>::sse_encode(self.vote_url, serializer);
     }
 }
 

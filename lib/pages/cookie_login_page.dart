@@ -146,11 +146,12 @@ class _CookieLoginPageState extends ConsumerState<CookieLoginPage> {
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     return Scaffold(
-      backgroundColor: const Color(0xFFF2F2F7), // iOS style background
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
       appBar: AppBar(
-        backgroundColor: Colors.white,
-        foregroundColor: Colors.black,
+        backgroundColor: Theme.of(context).appBarTheme.backgroundColor,
+        foregroundColor: Theme.of(context).appBarTheme.foregroundColor,
         elevation: 0,
         title: const Text('Cookie 登录', style: TextStyle(fontWeight: FontWeight.bold)),
       ),
@@ -164,7 +165,7 @@ class _CookieLoginPageState extends ConsumerState<CookieLoginPage> {
               width: double.infinity,
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: colorScheme.surface,
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(
                   color: _loggedIn ? Colors.green : Colors.red,
@@ -193,18 +194,21 @@ class _CookieLoginPageState extends ConsumerState<CookieLoginPage> {
 
             const SizedBox(height: 24),
             
-            const Text(
+            Text(
               '从浏览器复制 e-hentai.org 的 Cookie 值填入下方。\n'
               'ipb_member_id 和 ipb_pass_hash 为必填项。\n'
               '填写 igneous 可访问 ExHentai（前提是账号已开通）。',
-              style: TextStyle(color: Colors.black54, fontSize: 12, height: 1.6),
+              style: TextStyle(
+                  color: colorScheme.onSurface.withOpacity(0.6),
+                  fontSize: 12,
+                  height: 1.6),
             ),
 
             const SizedBox(height: 20),
 
             Container(
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: colorScheme.surface,
                 borderRadius: BorderRadius.circular(12),
               ),
               padding: const EdgeInsets.all(16),
@@ -249,7 +253,8 @@ class _CookieLoginPageState extends ConsumerState<CookieLoginPage> {
               child: ElevatedButton(
                 onPressed: _saving ? null : _save,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.blue,
+                  backgroundColor: colorScheme.primary,
+                  foregroundColor: colorScheme.onPrimary,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -263,12 +268,12 @@ class _CookieLoginPageState extends ConsumerState<CookieLoginPage> {
                           strokeWidth: 2,
                         ),
                       )
-                    : const Text(
+                    : Text(
                         '保存并登录',
                         style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
-                          color: Colors.white,
+                          color: colorScheme.onPrimary,
                         ),
                       ),
               ),
@@ -329,6 +334,8 @@ class _CookieFieldState extends State<_CookieField> {
   @override
   Widget build(BuildContext context) {
     final controller = widget.controller;
+    final colorScheme = Theme.of(context).colorScheme;
+    final onSurface = colorScheme.onSurface;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -336,8 +343,8 @@ class _CookieFieldState extends State<_CookieField> {
           children: [
             Text(
               widget.label,
-              style: const TextStyle(
-                color: Colors.black87,
+              style: TextStyle(
+                color: onSurface,
                 fontSize: 14,
                 fontWeight: FontWeight.w500,
               ),
@@ -353,12 +360,12 @@ class _CookieFieldState extends State<_CookieField> {
         TextField(
           controller: controller,
           obscureText: _obscured,
-          style: const TextStyle(color: Colors.black87, fontSize: 14),
+          style: TextStyle(color: onSurface, fontSize: 14),
           decoration: InputDecoration(
             hintText: widget.hint,
-            hintStyle: const TextStyle(color: Colors.black38, fontSize: 13),
+            hintStyle: TextStyle(color: onSurface.withOpacity(0.4), fontSize: 13),
             filled: true,
-            fillColor: const Color(0xFFF2F2F7),
+            fillColor: colorScheme.surfaceContainerHighest,
             contentPadding: const EdgeInsets.symmetric(
               horizontal: 14, vertical: 12),
             border: OutlineInputBorder(
@@ -372,7 +379,7 @@ class _CookieFieldState extends State<_CookieField> {
                   IconButton(
                     icon: Icon(
                       _obscured ? Icons.visibility_off : Icons.visibility,
-                      color: Colors.black38,
+                      color: onSurface.withOpacity(0.45),
                       size: 20,
                     ),
                     tooltip: _obscured ? '显示明文' : '隐藏',
@@ -382,7 +389,7 @@ class _CookieFieldState extends State<_CookieField> {
                     onPressed: () => setState(() => _obscured = !_obscured),
                   ),
                 IconButton(
-                  icon: const Icon(Icons.copy, color: Colors.black38, size: 20),
+                  icon: Icon(Icons.copy, color: onSurface.withOpacity(0.45), size: 20),
                   tooltip: '复制',
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
@@ -397,7 +404,7 @@ class _CookieFieldState extends State<_CookieField> {
                   },
                 ),
                 IconButton(
-                  icon: const Icon(Icons.content_paste, color: Colors.black38, size: 20),
+                  icon: Icon(Icons.content_paste, color: onSurface.withOpacity(0.45), size: 20),
                   tooltip: '从剪贴板粘贴',
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(minWidth: 32, minHeight: 32),

@@ -12,6 +12,7 @@ import '../providers/read_settings_provider.dart';
 import '../utils/haptics.dart';
 import '../utils/reader_progress.dart';
 import '../utils/gallery_detail_cache.dart';
+import '../widgets/glass.dart';
 
 /// Cache of viewer-page URL → real image URL, shared across page widgets so a
 /// page that is disposed and re-created (no KeepAlive) doesn't re-fetch the
@@ -519,8 +520,12 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
   Widget _buildTopOverlay() {
     return Positioned(
       top: 0, left: 0, right: 0,
-      child: Container(
-        color: Colors.black.withOpacity(0.7),
+      child: GlassContainer(
+        tint: Colors.black,
+        tintOpacity: 0.45,
+        // 阅读器浮层不需要描边（默认白色高光边框在浅色主题下会变成突兀的四边框）。
+        border: Border.all(color: Colors.transparent),
+        showHighlight: false,
         padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top),
         child: Row(
           children: [
@@ -557,8 +562,11 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
 
     return Positioned(
       bottom: 0, left: 0, right: 0,
-      child: Container(
-        color: Colors.black.withOpacity(0.7),
+      child: GlassContainer(
+        tint: Colors.black,
+        tintOpacity: 0.45,
+        border: Border.all(color: Colors.transparent),
+        showHighlight: false,
         padding: EdgeInsets.only(
           bottom: MediaQuery.of(context).padding.bottom + 16,
           top: 16, left: 24, right: 24,

@@ -11,6 +11,7 @@ import '../providers/read_settings_provider.dart';
 import '../src/rust/api.dart';
 import '../utils/haptics.dart';
 import '../utils/reader_progress.dart';
+import '../widgets/glass.dart';
 
 /// Offline reader for galleries downloaded by the Rust downloader.
 /// Images live under `{tempDir}/eh_downloads/{gid}/page_N.{ext}` and are read
@@ -394,8 +395,11 @@ class _OfflineViewerPageState extends ConsumerState<OfflineViewerPage> {
   Widget _buildTopOverlay(int total) {
     return Positioned(
       top: 0, left: 0, right: 0,
-      child: Container(
-        color: Colors.black.withOpacity(0.7),
+      child: GlassContainer(
+        tint: Colors.black,
+        tintOpacity: 0.45,
+        border: Border.all(color: Colors.transparent),
+        showHighlight: false,
         padding: EdgeInsets.only(top: MediaQuery.of(context).padding.top),
         child: Row(
           children: [
@@ -420,9 +424,11 @@ class _OfflineViewerPageState extends ConsumerState<OfflineViewerPage> {
   Widget _buildBottomOverlay(int total) {
     return Positioned(
       bottom: 0, left: 0, right: 0,
-      child: Container(
-        color: Colors.black.withOpacity(0.7),
-        padding: EdgeInsets.only(bottom: MediaQuery.of(context).padding.bottom),
+      child: GlassContainer(
+        tint: Colors.black,
+        tintOpacity: 0.45,
+        border: Border.all(color: Colors.transparent),
+        showHighlight: false,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
           child: Text(

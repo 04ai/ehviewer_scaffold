@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:share_plus/share_plus.dart';
 import '../providers/settings_provider.dart';
 
 import '../providers/history_provider.dart';
@@ -35,6 +36,7 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
   bool _isFavorited = false;
   DownloadTask? _downloadTask;
   int? _readerProgress;
+  final TextEditingController _commentCtrl = TextEditingController();
   bool _isRefreshing = false;
   bool _forceRefresh = false;
 
@@ -88,6 +90,28 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
     _forceRefresh = true;
     await _loadDetail();
     if (mounted) setState(() => _isRefreshing = false);
+  }
+
+  /// 发布评论（输入框回车 / 发送按钮共用）。
+  Future<void> _submitComment() async {
+    final val = _commentCtrl.text.trim();
+    if (val.isEmpty) return;
+    try {
+      final gidStr = widget.item.gid.split('/')[0];
+      await postComment(gid: gidStr, token: widget.item.token, content: val);
+      if (!mounted) return;
+      _commentCtrl.clear();
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('评论发布成功')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('评论失败: $e')));
+    }
+  }
+
+  @override
+  void dispose() {
+    _commentCtrl.dispose();
+    super.dispose();
   }
 
   Future<void> _checkFavoritedStatus() async {
@@ -176,7 +200,10 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
                     displayTitle,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 14, shadows: [
+                    // 显式固定颜色：主题切换的 lerp 动画期间，FlexibleSpaceBar
+                    // 标题默认继承主题 titleLarge 颜色并在 350ms 内渐变插值，
+                    // 叠加阴影后出现"虚影"。固定为白色即不受主题插值影响。
+                    style: const TextStyle(fontSize: 14, color: Colors.white, shadows: [
                       Shadow(color: Colors.black54, blurRadius: 4, offset: Offset(0, 1))
                     ]),
                   ),
@@ -310,7 +337,9 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
                           _buildActionBtn(
                             _isFavorited ? Icons.favorite : Icons.favorite_border,
                             _isFavorited ? "已收藏" : "收藏",
-                            _isFavorited ? Colors.pinkAccent : Colors.teal,
+                            _isFavorited
+                                ? Theme.of(context).colorScheme.primary
+                                : Theme.of(context).colorScheme.onSurface.withOpacity(0.6),
                             onTap: () async {
                               final isLocalFav = ref.read(favoritesProvider.notifier).isFavorite(widget.item.gid);
                               final favcat = await showDialog<String>(
@@ -392,7 +421,7 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
                               }
                             },
                               ),
-                          _buildActionBtn(Icons.thumb_up, "评分", Colors.teal, onTap: () => _showRateDialog()),
+                          _buildActionBtn(Icons.star_half, "评分", Theme.of(context).colorScheme.primary, onTap: () => _showRateDialog()),
                           _buildActionBtn(
                             _downloadTask == null
                                 ? Icons.download
@@ -411,13 +440,19 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
                             _downloadTask?.status == 2 ? Colors.green : Colors.blue,
                             onTap: () => _handleDownloadTap(),
                           ),
-                          _buildActionBtn(Icons.wb_twilight, "种子 (${_detail!.torrentCount})", Colors.teal, onTap: () => _showTorrents()),
-                          _buildActionBtn(Icons.archive, "档案", Colors.teal, onTap: () {
+                          _buildActionBtn(Icons.bolt, "种子 (${_detail!.torrentCount})", Theme.of(context).colorScheme.primary, onTap: () => _showTorrents()),
+                          _buildActionBtn(Icons.inventory_2_outlined, "档案", Theme.of(context).colorScheme.primary, onTap: () {
                             ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('档案下载需消耗GP，请在网页端操作')));
                           }),
-                          _buildActionBtn(Icons.reply, "分享", Colors.teal, onTap: () {
+                          _buildActionBtn(Icons.share_outlined, "分享", Theme.of(context).colorScheme.primary, onTap: () async {
                             final url = "https://e-hentai.org/g/${widget.item.gid.split('/')[0]}/${widget.item.token}/";
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('分享链接: $url')));
+                            // 呼出系统分享面板，分享到其它 App。
+                            await SharePlus.instance.share(
+                              ShareParams(
+                                text: '${_detail?.title ?? widget.item.title}\n$url',
+                                subject: _detail?.title,
+                              ),
+                            );
                           }),
                         ],
                       ),
@@ -532,15 +567,22 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
                                       },
                                       child: Container(
                                         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                                        // 跟随主题：secondaryContainer 是主题派生色，
+                                        // 深/浅色模式下自动适配，不再硬编码 teal。
                                         decoration: BoxDecoration(
-                                          color: Colors.teal.shade400,
+                                          color: Theme.of(context).colorScheme.secondaryContainer,
                                           borderRadius: BorderRadius.circular(14),
                                         ),
                                         child: Text(
                                           ref.watch(appearanceProvider).showTagTranslation
                                               ? translateTagSync(namespace: group.groupName, tag: t)
                                               : t,
-                                          style: const TextStyle(fontSize: 13, height: 1.2, color: Colors.white, fontWeight: FontWeight.w500)
+                                          style: TextStyle(
+                                            fontSize: 13,
+                                            height: 1.2,
+                                            color: Theme.of(context).colorScheme.onSecondaryContainer,
+                                            fontWeight: FontWeight.w500,
+                                          ),
                                         ),
                                       ),
                                     );
@@ -618,24 +660,20 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
                       children: [
                         Expanded(
                           child: TextField(
+                            controller: _commentCtrl,
                             decoration: InputDecoration(
                               hintText: '添加评论...',
                               border: OutlineInputBorder(borderRadius: BorderRadius.circular(20)),
                               contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                             ),
-                            onSubmitted: (val) async {
-                              if (val.trim().isEmpty) return;
-                              try {
-                                final gidStr = widget.item.gid.split('/')[0];
-                                await postComment(gid: gidStr, token: widget.item.token, content: val);
-                                if (!context.mounted) return;
-                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('评论发布成功')));
-                              } catch (e) {
-                                if (!context.mounted) return;
-                                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('评论失败: $e')));
-                              }
-                            },
+                            onSubmitted: (_) => _submitComment(),
                           ),
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton.filled(
+                          icon: const Icon(Icons.send, size: 20),
+                          tooltip: '发送评论',
+                          onPressed: _submitComment,
                         ),
                       ],
                     ),

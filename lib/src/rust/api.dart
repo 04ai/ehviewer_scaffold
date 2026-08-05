@@ -191,6 +191,13 @@ Future<String> voteGallery(
 Future<String> addWatchedTag({required String tag}) =>
     RustLib.instance.api.crateApiAddWatchedTag(tag: tag);
 
+/// Vote (like/dislike) on a gallery comment.
+/// `url` is the vote link parsed from the detail page HTML
+/// (`...gallerycomments.php?gid=...&act=vote&comment_id=...&vote=1`).
+/// Relative links are completed against the current site URL.
+Future<String> voteComment({required String url}) =>
+    RustLib.instance.api.crateApiVoteComment(url: url);
+
 /// Fetch one more page of comments from the gallery detail pages.
 /// Comments repeat across image pagination; callers should dedupe by
 /// (author, time, content). Returns an empty vec when there are no more.
