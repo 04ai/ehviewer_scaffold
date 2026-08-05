@@ -1,0 +1,40 @@
+name: ehviewer_scaffold
+description: A high-performance Android app scaffold using Rust and Flutter.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_rust_bridge: 2.12.0
+  flutter_riverpod: ^2.4.9
+  flutter_staggered_grid_view: ^0.7.0
+  webview_flutter: ^4.4.4
+  cached_network_image: ^3.3.0
+  shared_preferences: ^2.2.2
+  rust_lib_ehviewer_scaffold:
+    path: rust_builder
+  local_auth: ^2.3.0
+  screen_brightness: ^1.0.0
+  battery_plus: ^5.0.0
+  path_provider: ^2.1.5
+  permission_handler: ^11.3.1
+  intl: ^0.19.0
+  file_picker: ^8.0.3
+  flutter_windowmanager: ^0.2.0
+  flutter_cache_manager: ^3.3.1
+  flutter_staggered_animations: ^1.1.1
+  flutter_secure_storage: ^10.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

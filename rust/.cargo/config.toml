@@ -1,0 +1,14 @@
+# 16 KB page-size support (required on Android 15+/16 devices with 16 KB
+# memory pages). Without this, the Rust cdylib (.so) stays 4 KB-aligned and
+# fails to load on such devices (dlopen error / crash at startup).
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
