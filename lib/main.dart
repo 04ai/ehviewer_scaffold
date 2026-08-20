@@ -481,26 +481,7 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
     _searchController.dispose();
     _searchFocusNode.dispose();
     _tabIndicatorTimer?.cancel();
-    _drawerBlurTimer?.cancel();
     super.dispose();
-  }
-
-  // ── 抽屉毛玻璃：动画期间降级为纯半透明，动画结束再启用模糊 ──────────
-  // BackdropFilter 在抽屉开合动画的 ~250ms 内每帧重采样背景，低端 GPU
-  // 会掉帧；动画结束后背景静止，模糊只算一次，等价于"静态模糊快照"。
-  bool _drawerBlurOn = false;
-  Timer? _drawerBlurTimer;
-
-  void _onDrawerChanged(bool open) {
-    _drawerBlurTimer?.cancel();
-    if (open) {
-      // 等动画结束后再开模糊（抽屉动画约 250ms）。
-      _drawerBlurTimer = Timer(const Duration(milliseconds: 350), () {
-        if (mounted) setState(() => _drawerBlurOn = true);
-      });
-    } else {
-      if (mounted) setState(() => _drawerBlurOn = false);
-    }
   }
 
   void _refresh() {
@@ -521,33 +502,64 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
   }
 
   // ─── 侧边栏头部：账号头像 + 名字 ──────────────────────────────────────────
+  // ─── 侧边栏头部：账号头像 + 名字 ──────────────────────────────────────────
   Widget _buildDrawerHeader(AccountInfo account) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
     return InkWell(
       onTap: () {
         Navigator.pop(context);
         Navigator.push(context, MaterialPageRoute(builder: (_) => const CookieLoginPage()));
       },
       child: Container(
-        padding: const EdgeInsets.fromLTRB(16, 48, 16, 16),
-        color: Theme.of(context).colorScheme.primary,
+        padding: const EdgeInsets.fromLTRB(20, 56, 20, 20),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: isDark
+                ? [
+                    colorScheme.primary.withOpacity(0.25),
+                    colorScheme.surface,
+                  ]
+                : [
+                    colorScheme.primary.withOpacity(0.12),
+                    colorScheme.surface,
+                  ],
+          ),
+          border: Border(
+            bottom: BorderSide(
+              color: isDark ? Colors.white10 : Colors.black.withOpacity(0.06),
+            ),
+          ),
+        ),
         child: Row(
           children: [
-            CircleAvatar(
-              radius: 28,
-              backgroundColor: const Color(0xFFE94560),
-              backgroundImage: account.avatarUrl.isNotEmpty
-                  ? NetworkImage(account.avatarUrl)
-                  : null,
-              child: account.avatarUrl.isEmpty
-                  ? Text(
-                      account.isLoggedIn
-                          ? account.username.substring(0, 1).toUpperCase()
-                          : '?',
-                      style: const TextStyle(fontSize: 22, color: Colors.white, fontWeight: FontWeight.bold),
-                    )
-                  : null,
+            Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: colorScheme.primary.withOpacity(0.6),
+                  width: 2,
+                ),
+              ),
+              child: CircleAvatar(
+                radius: 26,
+                backgroundColor: colorScheme.primary,
+                backgroundImage: account.avatarUrl.isNotEmpty
+                    ? NetworkImage(account.avatarUrl)
+                    : null,
+                child: account.avatarUrl.isEmpty
+                    ? Text(
+                        account.isLoggedIn && account.username.isNotEmpty
+                            ? account.username.substring(0, 1).toUpperCase()
+                            : '?',
+                        style: const TextStyle(fontSize: 20, color: Colors.white, fontWeight: FontWeight.bold),
+                      )
+                    : null,
+              ),
             ),
-            const SizedBox(width: 12),
+            const SizedBox(width: 14),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -555,21 +567,26 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
                 children: [
                   Text(
                     account.isLoggedIn ? account.username : '未登录',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 17,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: colorScheme.onSurface,
+                      fontSize: 16,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
                   const SizedBox(height: 4),
                   Text(
                     account.isLoggedIn ? '点击管理账号' : '点击登录 E-Hentai',
-                    style: const TextStyle(color: Colors.white60, fontSize: 12),
+                    style: TextStyle(
+                      color: colorScheme.onSurface.withOpacity(0.6),
+                      fontSize: 12,
+                    ),
                   ),
                 ],
               ),
             ),
-            const Icon(Icons.arrow_forward_ios, color: Colors.white38, size: 14),
+            Icon(Icons.chevron_right, color: colorScheme.onSurface.withOpacity(0.4), size: 20),
           ],
         ),
       ),
@@ -585,36 +602,42 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
     bool isActive = false,
     Widget? trailing,
   }) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    
+    final activeBg = isDark
+        ? colorScheme.primary.withOpacity(0.18)
+        : colorScheme.primary.withOpacity(0.10);
+    final activeFg = colorScheme.primary;
+    final inactiveFg = colorScheme.onSurface.withOpacity(0.8);
+
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
       decoration: BoxDecoration(
-        color: isActive
-            ? Theme.of(context).colorScheme.primaryContainer.withOpacity(0.35)
-            : Colors.transparent,
-        borderRadius: BorderRadius.circular(12),
+        color: isActive ? activeBg : Colors.transparent,
+        borderRadius: BorderRadius.circular(16),
+        border: isActive
+            ? Border.all(color: colorScheme.primary.withOpacity(0.3), width: 1.0)
+            : null,
       ),
       child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
         leading: Icon(
           icon,
-          color: isActive
-              ? Theme.of(context).colorScheme.primary
-              : Theme.of(context).iconTheme.color?.withOpacity(0.65),
+          size: 22,
+          color: isActive ? activeFg : colorScheme.onSurface.withOpacity(0.65),
         ),
         title: Text(
           label,
           style: TextStyle(
-            fontSize: 16,
-            fontWeight: isActive ? FontWeight.bold : FontWeight.normal,
-            color: isActive
-                ? Theme.of(context).colorScheme.primary
-                : Theme.of(context).textTheme.bodyLarge?.color,
+            fontSize: 15,
+            fontWeight: isActive ? FontWeight.bold : FontWeight.w500,
+            color: isActive ? activeFg : inactiveFg,
           ),
         ),
         trailing: trailing,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        onTap: () {
-          onTap();
-        },
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        onTap: onTap,
       ),
     );
   }
@@ -745,111 +768,140 @@ class _GalleryListPageState extends ConsumerState<GalleryListPage> with TickerPr
         // 边缘滑出宽度默认 20px 偏窄（费力），36px 更易滑出；
         // 不算太大，竖直滚动瀑布流时不易误触（Flutter 只识别边缘水平拖拽）。
         drawerEdgeDragWidth: 36,
-        onDrawerChanged: _onDrawerChanged,
         drawer: Drawer(
           backgroundColor: Colors.transparent,
-          // 毛玻璃抽屉：模糊背后的主体页面（Drawer 是 overlay 层，BackdropFilter 有效）。
-          // 开合动画期间 forceDisable 降级为纯半透明，动画结束恢复模糊，
-          // 避免动画期每帧重采样背景导致掉帧。
           child: GlassContainer(
             tint: Theme.of(context).colorScheme.surface,
-            tintOpacity: 0.45,
-            borderRadius: BorderRadius.zero,
-            forceDisable: !_drawerBlurOn,
-            child: ListView(
-            padding: EdgeInsets.zero,
-            children: [
-              _buildDrawerHeader(account),
-              const SizedBox(height: 8),
+            tintOpacity: 0.94,
+            borderRadius: const BorderRadius.horizontal(right: Radius.circular(20)),
+            child: SafeArea(
+              top: false,
+              bottom: true,
+              child: ListView(
+                padding: EdgeInsets.zero,
+                children: [
+                  _buildDrawerHeader(account),
+                  const SizedBox(height: 12),
 
-              _buildDrawerItem(
-                icon: Icons.home,
-                label: '主页',
-                pageKey: 'home',
-                isActive: currentPage == 'home',
-                onTap: () {
-                  ref.read(currentPageProvider.notifier).state = 'home';
-                  Navigator.pop(context);
-                },
-                trailing: IconButton(
-                  icon: const Icon(Icons.settings, size: 20, color: Colors.black45),
-                  onPressed: () {
-                    Navigator.pop(context);
-                    _showManageTabsDialog();
-                  },
-                  tooltip: '管理瀑布流',
-                )
-              ),
+                  _buildDrawerItem(
+                    icon: Icons.home_rounded,
+                    label: '主页',
+                    pageKey: 'home',
+                    isActive: currentPage == 'home',
+                    onTap: () {
+                      ref.read(currentPageProvider.notifier).state = 'home';
+                      Navigator.pop(context);
+                    },
+                    trailing: IconButton(
+                      icon: Icon(
+                        Icons.tune_rounded,
+                        size: 20,
+                        color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6),
+                      ),
+                      onPressed: () {
+                        Navigator.pop(context);
+                        _showManageTabsDialog();
+                      },
+                      tooltip: '管理瀑布流',
+                    ),
+                  ),
 
-              const Padding(padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4), child: Divider(height: 1)),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                    child: Divider(
+                      height: 1,
+                      color: Theme.of(context).colorScheme.onSurface.withOpacity(0.08),
+                    ),
+                  ),
 
-              _buildDrawerItem(
-                icon: Icons.subscriptions, label: '订阅', pageKey: 'subscription',
-                isActive: currentPage == 'subscription',
-                onTap: () {
-                  ref.read(currentPageProvider.notifier).state = 'subscription';
-                  Navigator.pop(context);
-                },
-              ),
-              _buildDrawerItem(
-                icon: Icons.local_fire_department, label: '热门', pageKey: 'popular',
-                isActive: currentPage == 'popular',
-                onTap: () {
-                  ref.read(currentPageProvider.notifier).state = 'popular';
-                  Navigator.pop(context);
-                },
-              ),
-              _buildDrawerItem(
-                icon: Icons.leaderboard, label: '排行榜', pageKey: 'ranking',
-                isActive: false,
-                onTap: () {
-                  Navigator.pop(context);
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(builder: (_) => const RankingPage()),
-                  );
-                },
-              ),
-              _buildDrawerItem(
-                icon: Icons.favorite, label: '收藏', pageKey: 'favorites',
-                isActive: currentPage == 'favorites',
-                onTap: () {
-                  Navigator.pop(context);
-                  Navigator.push(context, MaterialPageRoute(builder: (_) => const FavoritesPage()));
-                },
-              ),
-              _buildDrawerItem(
-                icon: Icons.history, label: '历史', pageKey: 'history',
-                isActive: currentPage == 'history',
-                onTap: () {
-                  ref.read(currentPageProvider.notifier).state = 'history';
-                  Navigator.pop(context);
-                },
-              ),
+                  _buildDrawerItem(
+                    icon: Icons.subscriptions_rounded,
+                    label: '订阅',
+                    pageKey: 'subscription',
+                    isActive: currentPage == 'subscription',
+                    onTap: () {
+                      ref.read(currentPageProvider.notifier).state = 'subscription';
+                      Navigator.pop(context);
+                    },
+                  ),
+                  _buildDrawerItem(
+                    icon: Icons.local_fire_department_rounded,
+                    label: '热门',
+                    pageKey: 'popular',
+                    isActive: currentPage == 'popular',
+                    onTap: () {
+                      ref.read(currentPageProvider.notifier).state = 'popular';
+                      Navigator.pop(context);
+                    },
+                  ),
+                  _buildDrawerItem(
+                    icon: Icons.leaderboard_rounded,
+                    label: '排行榜',
+                    pageKey: 'ranking',
+                    isActive: false,
+                    onTap: () {
+                      Navigator.pop(context);
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (_) => const RankingPage()),
+                      );
+                    },
+                  ),
+                  _buildDrawerItem(
+                    icon: Icons.favorite_rounded,
+                    label: '收藏',
+                    pageKey: 'favorites',
+                    isActive: currentPage == 'favorites',
+                    onTap: () {
+                      Navigator.pop(context);
+                      Navigator.push(context, MaterialPageRoute(builder: (_) => const FavoritesPage()));
+                    },
+                  ),
+                  _buildDrawerItem(
+                    icon: Icons.history_rounded,
+                    label: '历史',
+                    pageKey: 'history',
+                    isActive: currentPage == 'history',
+                    onTap: () {
+                      ref.read(currentPageProvider.notifier).state = 'history';
+                      Navigator.pop(context);
+                    },
+                  ),
 
-              const Padding(padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4), child: Divider(height: 1)),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                    child: Divider(
+                      height: 1,
+                      color: Theme.of(context).colorScheme.onSurface.withOpacity(0.08),
+                    ),
+                  ),
 
-              _buildDrawerItem(
-                icon: Icons.download, label: '下载', pageKey: 'downloads',
-                isActive: currentPage == 'downloads',
-                onTap: () {
-                  ref.read(currentPageProvider.notifier).state = 'downloads';
-                  Navigator.pop(context);
-                  Navigator.push(context, MaterialPageRoute(builder: (_) => const DownloadsPage()));
-                },
+                  _buildDrawerItem(
+                    icon: Icons.download_rounded,
+                    label: '下载',
+                    pageKey: 'downloads',
+                    isActive: currentPage == 'downloads',
+                    onTap: () {
+                      ref.read(currentPageProvider.notifier).state = 'downloads';
+                      Navigator.pop(context);
+                      Navigator.push(context, MaterialPageRoute(builder: (_) => const DownloadsPage()));
+                    },
+                  ),
+                  _buildDrawerItem(
+                    icon: Icons.settings_rounded,
+                    label: '设置',
+                    pageKey: 'settings',
+                    isActive: currentPage == 'settings',
+                    onTap: () {
+                      Navigator.pop(context);
+                      _openSettings();
+                    },
+                  ),
+                ],
               ),
-              _buildDrawerItem(
-                icon: Icons.settings, label: '设置', pageKey: 'settings',
-                isActive: currentPage == 'settings',
-                onTap: () {
-                  Navigator.pop(context);
-                  _openSettings();
-                },
-              ),
-            ],
+            ),
           ),
         ),
-      ),
       body: Builder(builder: (context) {
         switch (currentPage) {
           case 'subscription':

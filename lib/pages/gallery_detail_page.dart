@@ -101,7 +101,9 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
       await postComment(gid: gidStr, token: widget.item.token, content: val);
       if (!mounted) return;
       _commentCtrl.clear();
+      FocusManager.instance.primaryFocus?.unfocus();
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('评论发布成功')));
+      _refreshDetail();
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('评论失败: $e')));
@@ -626,8 +628,8 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
                           )),
                           Center(
                             child: TextButton(
-                              onPressed: () {
-                                Navigator.push(
+                              onPressed: () async {
+                                final needRefresh = await Navigator.push<bool>(
                                   context,
                                   MaterialPageRoute(
                                     builder: (_) => GalleryCommentsPage(
@@ -637,6 +639,9 @@ class _GalleryDetailPageState extends ConsumerState<GalleryDetailPage> {
                                     ),
                                   ),
                                 );
+                                if (needRefresh == true) {
+                                  _refreshDetail();
+                                }
                               },
                               child: Text("查看更多评论", style: TextStyle(color: Theme.of(context).colorScheme.primary)),
                             ),

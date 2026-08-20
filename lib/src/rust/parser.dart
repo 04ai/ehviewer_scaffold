@@ -6,6 +6,57 @@
 import 'frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+class EhWebConfig {
+  final String loadHath;
+  final String imageSize;
+  final String imageWidth;
+  final String imageHeight;
+  final String titleDisplay;
+  final String archiverSettings;
+  final String displayMode;
+  final List<String> favoriteNames;
+  final Map<String, String> rawParams;
+
+  const EhWebConfig({
+    required this.loadHath,
+    required this.imageSize,
+    required this.imageWidth,
+    required this.imageHeight,
+    required this.titleDisplay,
+    required this.archiverSettings,
+    required this.displayMode,
+    required this.favoriteNames,
+    required this.rawParams,
+  });
+
+  @override
+  int get hashCode =>
+      loadHath.hashCode ^
+      imageSize.hashCode ^
+      imageWidth.hashCode ^
+      imageHeight.hashCode ^
+      titleDisplay.hashCode ^
+      archiverSettings.hashCode ^
+      displayMode.hashCode ^
+      favoriteNames.hashCode ^
+      rawParams.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EhWebConfig &&
+          runtimeType == other.runtimeType &&
+          loadHath == other.loadHath &&
+          imageSize == other.imageSize &&
+          imageWidth == other.imageWidth &&
+          imageHeight == other.imageHeight &&
+          titleDisplay == other.titleDisplay &&
+          archiverSettings == other.archiverSettings &&
+          displayMode == other.displayMode &&
+          favoriteNames == other.favoriteNames &&
+          rawParams == other.rawParams;
+}
+
 class GalleryComment {
   final String author;
   final String time;

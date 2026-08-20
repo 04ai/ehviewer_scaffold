@@ -93,10 +93,10 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
     _listController.addListener(_handleVerticalScroll);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      // Bug 3 fix: explicit jump so the correct page is shown regardless of
-      // whether PageController honoured initialPage during the first layout.
-      if (widget.initialPage > 0 && _pageController.hasClients) {
-        _pageController.jumpToPage(widget.initialPage);
+      if (widget.initialPage > 0) {
+        _jumpToPage(widget.initialPage);
+      } else if (_currentPage >= _allImageUrls.length - 5 && _hasMorePages) {
+        _loadMoreImages();
       }
       _applyScreenSettings();
       _startTimers();
@@ -324,17 +324,16 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
   }
 
   /// Jump to [target] (0-indexed), lazily loading enough pages first so the
-  /// PageView can actually reach it. Clamps to the last loaded page when the
-  /// target is beyond everything that could be loaded.
+  /// PageView can actually reach it. Preloads subsequent pages so swiping forward works.
   Future<void> _jumpToPage(int target) async {
-    while (target >= _allImageUrls.length && _hasMorePages && mounted) {
+    while (target >= _allImageUrls.length - 5 && _hasMorePages && mounted) {
       final before = _allImageUrls.length;
       await _loadMoreImages();
       if (!mounted || _allImageUrls.length <= before) break; // no progress
     }
     if (!mounted || !_pageController.hasClients) return;
     final clamped = target.clamp(0, _allImageUrls.length - 1);
-    if (clamped == _currentPage) return;
+    _currentPage = clamped;
     _pageController.jumpToPage(clamped);
   }
 
@@ -399,22 +398,26 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
               bottom: MediaQuery.of(context).padding.bottom + 88,
               left: 0,
               right: 0,
-              child: const Center(
+              child: Center(
                 child: Card(
                   color: Colors.black54,
                   child: Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        SizedBox(
+                        const SizedBox(
                           width: 14, height: 14,
                           child: CircularProgressIndicator(
                               strokeWidth: 2, color: Colors.white70),
                         ),
-                        SizedBox(width: 8),
-                        Text('加载更多图片...',
-                            style: TextStyle(color: Colors.white70, fontSize: 12)),
+                        const SizedBox(width: 8),
+                        Text(
+                          _sliderDragValue != null
+                              ? '正在跳转至第 ${(_sliderDragValue! + 1)} 页...'
+                              : '加载更多图片...',
+                          style: const TextStyle(color: Colors.white70, fontSize: 12),
+                        ),
                       ],
                     ),
                   ),
@@ -430,7 +433,7 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
             child: IgnorePointer(
               child: Center(
                 child: AnimatedOpacity(
-                  opacity: _pageIndicatorOpacity,
+                  opacity: _sliderDragValue != null ? 1.0 : _pageIndicatorOpacity,
                   duration: const Duration(milliseconds: 300),
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
@@ -439,7 +442,7 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
                       borderRadius: BorderRadius.circular(16),
                     ),
                     child: Text(
-                      '${_currentPage + 1} / $_totalPages',
+                      '${(_sliderDragValue ?? _currentPage) + 1} / $_totalPages',
                       style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
                     ),
                   ),
@@ -574,7 +577,7 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
         child: Row(
           children: [
             Text(
-              _allImageUrls.isEmpty ? '0' : '${_currentPage + 1}',
+              _allImageUrls.isEmpty ? '0' : '${(_sliderDragValue ?? _currentPage) + 1}',
               style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
             ),
             Expanded(
@@ -590,9 +593,16 @@ class _GalleryViewerPageState extends ConsumerState<GalleryViewerPage> {
                     : (val) => setState(() => _sliderDragValue = val.toInt()),
                 onChangeEnd: isVertical
                     ? null
-                    : (val) {
-                        setState(() => _sliderDragValue = null);
-                        _jumpToPage(val.toInt());
+                    : (val) async {
+                        final target = val.toInt();
+                        setState(() => _sliderDragValue = target);
+                        try {
+                          await _jumpToPage(target);
+                        } finally {
+                          if (mounted) {
+                            setState(() => _sliderDragValue = null);
+                          }
+                        }
                       },
               ),
             ),

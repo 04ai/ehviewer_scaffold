@@ -152,42 +152,79 @@ class _ThumbnailsPageState extends State<ThumbnailsPage> {
                 border: Border.all(color: Colors.grey.shade300),
                 borderRadius: BorderRadius.circular(4),
               ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(4),
-                child: Stack(
-                  children: [
-                    if (thumb.url.isNotEmpty)
-                      Positioned.fill(
-                        child: CachedNetworkImage(
-                          imageUrl: thumb.url,
-                          fit: BoxFit.cover,
-                          alignment: FractionalOffset(
-                            thumb.offsetX == 0 ? 0 : 0.5, // Rough approximation since we don't have full sprite support here yet, usually E-Hentai sends direct links now if signed in
-                            0,
-                          ),
-                          placeholder: (context, url) => Container(color: Colors.grey[200]),
-                          errorWidget: (context, url, error) => const Icon(Icons.error),
-                        ),
+              clipBehavior: Clip.antiAlias,
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: _buildThumbnailSprite(thumb, index),
+                  ),
+                  Positioned(
+                    bottom: 4,
+                    right: 4,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.6),
+                        borderRadius: BorderRadius.circular(4),
                       ),
-                    Positioned(
-                      bottom: 4,
-                      right: 4,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                        color: Colors.black54,
-                        child: Text(
-                          '${index + 1}',
-                          style: const TextStyle(color: Colors.white, fontSize: 10),
-                        ),
+                      child: Text(
+                        '${index + 1}',
+                        style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
                       ),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
             ),
           );
         },
       ),
     );
+  }
+
+  Widget _buildThumbnailSprite(GalleryThumbnail thumb, int index) {
+    if (thumb.url.isEmpty) {
+      return Center(child: Text("${index + 1}", style: const TextStyle(color: Colors.black38)));
+    }
+
+    if (thumb.width > 0 && thumb.height > 0) {
+      return FittedBox(
+        fit: BoxFit.contain,
+        child: ClipRect(
+          child: SizedBox(
+            width: thumb.width.toDouble(),
+            height: thumb.height.toDouble(),
+            child: Stack(
+              children: [
+                Positioned(
+                  left: -thumb.offsetX.toDouble(),
+                  top: -thumb.offsetY.toDouble(),
+                  child: CachedNetworkImage(
+                    imageUrl: thumb.url,
+                    fit: BoxFit.none,
+                    errorWidget: (context, url, error) => Container(
+                      width: thumb.width.toDouble(),
+                      height: thumb.height.toDouble(),
+                      color: Colors.black12,
+                      child: Center(child: Text("${index + 1}", style: const TextStyle(color: Colors.black38))),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    } else {
+      return CachedNetworkImage(
+        imageUrl: thumb.url,
+        fit: BoxFit.cover,
+        placeholder: (context, url) => Container(color: Colors.grey[200]),
+        errorWidget: (context, url, error) => Container(
+          color: Colors.black12,
+          child: Center(child: Text("${index + 1}", style: const TextStyle(color: Colors.black38))),
+        ),
+      );
+    }
   }
 }

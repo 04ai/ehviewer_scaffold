@@ -197,7 +197,8 @@ impl NetworkClient {
         let client = self.client.read().await.clone();
 
         let mut req = client.post(url)
-            .header(header::REFERER, &site)
+            .header(header::REFERER, url)
+            .header(header::ORIGIN, &site)
             .form(form_data);
 
         if !cookie.is_empty() {

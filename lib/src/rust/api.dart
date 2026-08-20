@@ -220,6 +220,14 @@ Future<String> rateGallery(
 Future<String> fetchAutocomplete({required String prefix}) =>
     RustLib.instance.api.crateApiFetchAutocomplete(prefix: prefix);
 
+/// Fetch user configuration from uconfig.php
+Future<EhWebConfig> fetchEhWebConfig() =>
+    RustLib.instance.api.crateApiFetchEhWebConfig();
+
+/// Save user configuration to uconfig.php
+Future<String> saveEhWebConfig({required List<(String, String)> params}) =>
+    RustLib.instance.api.crateApiSaveEhWebConfig(params: params);
+
 class SearchOptions {
   final bool fSname;
   final bool fStags;

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use flutter_rust_bridge::DartFnFuture;
 use crate::network::NetworkClient;
-use crate::parser::{GalleryItem, GalleryDetail};
+use crate::parser::{GalleryItem, GalleryDetail, EhWebConfig};
 use crate::cache::CacheEngine;
 use lazy_static::lazy_static;
 use std::sync::Arc;
@@ -506,9 +506,17 @@ pub async fn post_comment(gid: String, token: String, content: String) -> Result
     
     let form = [
         ("commenttext_new", content.as_str()),
+        ("postcomment", "Post Comment"),
     ];
     
     let res = NETWORK_CLIENT.post_form(&url, &form).await?;
+    let lower = res.to_lowercase();
+    if lower.contains("requires you to log on") || lower.contains("must be logged in") || lower.contains("not logged in") || lower.contains("have to register") {
+        anyhow::bail!("评论发送失败：账号未登录或 Cookie 已失效");
+    }
+    if lower.contains("your comment was not posted") || lower.contains("posting comments too quickly") {
+        anyhow::bail!("评论未被发布：发送过于频繁或被服务器拦截");
+    }
     Ok(res)
 }
 
@@ -625,14 +633,43 @@ pub async fn add_watched_tag(tag: String) -> Result<String> {
 /// (`...gallerycomments.php?gid=...&act=vote&comment_id=...&vote=1`).
 /// Relative links are completed against the current site URL.
 pub async fn vote_comment(url: String) -> Result<String> {
+    let site = NETWORK_CLIENT.get_site_url().await;
     let full = if url.starts_with("http") {
-        url
-    } else {
-        let site = NETWORK_CLIENT.get_site_url().await;
+        url.clone()
+    } else if url.starts_with('/') {
         format!("{}{}", site, url)
+    } else {
+        format!("{}/{}", site, url)
     };
     log::info!("Vote comment → {}", full);
-    NETWORK_CLIENT.get_html(&full).await
+
+    // Attempt POST form submission first (as E-Hentai JS vote_comment function uses POST)
+    if let Some(pos) = full.find('?') {
+        let base_path = &full[..pos];
+        let query_str = &full[pos + 1..];
+        let mut params = Vec::new();
+        for pair in query_str.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                params.push((k, v));
+            }
+        }
+        if !params.is_empty() {
+            if let Ok(post_res) = NETWORK_CLIENT.post_form(base_path, &params).await {
+                let lower = post_res.to_lowercase();
+                if lower.contains("not logged in") || lower.contains("insufficient") || lower.contains("requires you to log on") {
+                    anyhow::bail!("评论投票失败：请确认已登录账号");
+                }
+                return Ok(post_res);
+            }
+        }
+    }
+
+    let res = NETWORK_CLIENT.get_html(&full).await?;
+    let lower = res.to_lowercase();
+    if lower.contains("not logged in") || lower.contains("insufficient") || lower.contains("requires you to log on") {
+        anyhow::bail!("评论投票失败：请确认已登录账号");
+    }
+    Ok(res)
 }
 
 /// Fetch one more page of comments from the gallery detail pages.
@@ -677,6 +714,29 @@ pub async fn fetch_autocomplete(prefix: String) -> Result<String> {
     
     let res = NETWORK_CLIENT.post_json(&url, &payload).await?;
     Ok(res)
+}
+
+/// Fetch user configuration from uconfig.php
+pub async fn fetch_eh_web_config() -> Result<EhWebConfig> {
+    let site_url = NETWORK_CLIENT.get_site_url().await;
+    let url = format!("{}/uconfig.php", site_url);
+    let html = NETWORK_CLIENT.get_html(&url).await?;
+    if html.contains("requires you to log on") || html.contains("You must be logged in") {
+        anyhow::bail!("未登录账号或登录态失效，请重新登录");
+    }
+    crate::parser::parse_eh_web_config(&html)
+}
+
+/// Save user configuration to uconfig.php
+pub async fn save_eh_web_config(params: Vec<(String, String)>) -> Result<String> {
+    let site_url = NETWORK_CLIENT.get_site_url().await;
+    let url = format!("{}/uconfig.php", site_url);
+    let form_fields: Vec<(&str, &str)> = params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let res = NETWORK_CLIENT.post_form(&url, &form_fields).await?;
+    if res.contains("requires you to log on") || res.contains("You must be logged in") {
+        anyhow::bail!("保存设置失败：会话已失效，请重新登录");
+    }
+    Ok("设置已成功提交保存".to_string())
 }
 
 #[cfg(test)]

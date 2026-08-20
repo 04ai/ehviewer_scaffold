@@ -31,14 +31,19 @@ Future<bool> loadAndSyncCookies() async {
 
 String _buildCookieString(
   String memberId, String passHash, String igneous, String sk) {
+  final cleanMemberId = memberId.trim().replaceAll('"', '').replaceAll("'", '');
+  final cleanPassHash = passHash.trim().replaceAll('"', '').replaceAll("'", '');
+  final cleanIgneous  = igneous.trim().replaceAll('"', '').replaceAll("'", '');
+  final cleanSk       = sk.trim().replaceAll('"', '').replaceAll("'", '');
+
   final parts = <String>[
-    'ipb_member_id=$memberId',
-    'ipb_pass_hash=$passHash',
+    'ipb_member_id=$cleanMemberId',
+    'ipb_pass_hash=$cleanPassHash',
     'nw=1', // Bypass content warning
     'inline_set=ts_m', // Force Minimal layout for parser compatibility
   ];
-  if (igneous.isNotEmpty) parts.add('igneous=$igneous');
-  if (sk.isNotEmpty)      parts.add('sk=$sk');
+  if (cleanIgneous.isNotEmpty) parts.add('igneous=$cleanIgneous');
+  if (cleanSk.isNotEmpty)      parts.add('sk=$cleanSk');
   return parts.join('; ');
 }
 

@@ -42,6 +42,19 @@ pub struct GalleryComment {
     pub vote_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EhWebConfig {
+    pub load_hath: String,
+    pub image_size: String,
+    pub image_width: String,
+    pub image_height: String,
+    pub title_display: String,
+    pub archiver_settings: String,
+    pub display_mode: String,
+    pub favorite_names: Vec<String>,
+    pub raw_params: std::collections::HashMap<String, String>,
+}
+
 /// Parse gallery comments from a detail-page HTML document
 /// (structure: #cdiv > div.c1 [id="c_<n>"] > div.c3 [meta] + div.c6 [content],
 /// plus optional vote links / score spans).
@@ -52,15 +65,30 @@ pub fn parse_comments(html: &str) -> Vec<GalleryComment> {
     let c3_sel = Selector::parse("div.c3").unwrap();
     let c6_sel = Selector::parse("div.c6").unwrap();
     let author_sel = Selector::parse("a").unwrap();
-    let vote_sel = Selector::parse("a[href*='act=vote']").unwrap();
+    let vote_sel = Selector::parse("a[href*='act=vote'], a[href*='gallerycomments.php']").unwrap();
     let score_sel = Selector::parse("span[id*='comment_score'], span.score, span#score").unwrap();
 
     for c1 in document.select(&c1_sel) {
-        // Comment id: <div class="c1" id="c_123456">
+        // Comment id: <div class="c1" id="c_123456"> or <a name="c123456">
         let mut cid: u64 = 0;
+        let c1_html = c1.html();
         if let Some(id_attr) = c1.value().attr("id") {
             if let Some(rest) = id_attr.strip_prefix("c_") {
                 cid = rest.parse().unwrap_or(0);
+            }
+        }
+        if cid == 0 {
+            for key in &["comment_id=", "vote_comment(", "id=\"comment_", "id=\"cvotes_", "id=\"comment_score_", "id=\"c_", "name=\"c"] {
+                if let Some(pos) = c1_html.find(key) {
+                    let rest = &c1_html[pos + key.len()..];
+                    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(val) = digits.parse::<u64>() {
+                        if val > 0 {
+                            cid = val;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -80,10 +108,13 @@ pub fn parse_comments(html: &str) -> Vec<GalleryComment> {
                 let content = c6.text().collect::<String>().trim().to_string();
                 if !author.is_empty() {
                     // Vote link (first one; it encodes vote=1 for like).
-                    let vote_url = c1.select(&vote_sel).next()
+                    let mut vote_url = c1.select(&vote_sel).next()
                         .and_then(|el| el.value().attr("href"))
                         .unwrap_or("")
                         .to_string();
+                    if vote_url.is_empty() && cid > 0 {
+                        vote_url = format!("gallerycomments.php?act=vote&comment_id={}&vote=1", cid);
+                    }
                     // Score: prefer a dedicated span, fall back to a signed number
                     // in the vote area.
                     let mut score: i32 = 0;
@@ -616,9 +647,88 @@ pub fn parse_torrents(html: &str) -> Vec<TorrentItem> {
     items
 }
 
+/// Parse user configuration settings from uconfig.php HTML
+pub fn parse_eh_web_config(html: &str) -> Result<EhWebConfig> {
+    let document = Html::parse_document(html);
+    let mut raw_params = std::collections::HashMap::new();
+
+    let input_sel = Selector::parse("input").unwrap();
+    let select_sel = Selector::parse("select").unwrap();
+    let option_sel = Selector::parse("option").unwrap();
+    let textarea_sel = Selector::parse("textarea").unwrap();
+
+    for input in document.select(&input_sel) {
+        let val_attr = input.value();
+        let name = val_attr.attr("name").unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let typ = val_attr.attr("type").unwrap_or("text");
+        let value = val_attr.attr("value").unwrap_or_default();
+
+        if matches!(typ, "radio" | "checkbox") {
+            if val_attr.attr("checked").is_some() {
+                raw_params.insert(name.to_string(), value.to_string());
+            }
+        } else if !matches!(typ, "submit" | "button" | "reset" | "image") {
+            raw_params.insert(name.to_string(), value.to_string());
+        }
+    }
+
+    for select in document.select(&select_sel) {
+        let name = select.value().attr("name").unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let mut selected_val = String::new();
+        for opt in select.select(&option_sel) {
+            let val = opt.value().attr("value").unwrap_or_default();
+            if opt.value().attr("selected").is_some() || selected_val.is_empty() {
+                selected_val = val.to_string();
+            }
+        }
+        raw_params.insert(name.to_string(), selected_val);
+    }
+
+    for textarea in document.select(&textarea_sel) {
+        let name = textarea.value().attr("name").unwrap_or_default();
+        if !name.is_empty() {
+            let text = textarea.text().collect::<String>();
+            raw_params.insert(name.to_string(), text);
+        }
+    }
+
+    let load_hath = raw_params.get("uh").cloned().unwrap_or_else(|| "0".to_string());
+    let image_size = raw_params.get("xr").cloned().unwrap_or_else(|| "0".to_string());
+    let image_width = raw_params.get("xr_w").cloned().unwrap_or_default();
+    let image_height = raw_params.get("xr_h").cloned().unwrap_or_default();
+    let title_display = raw_params.get("lt").cloned().unwrap_or_else(|| "0".to_string());
+    let archiver_settings = raw_params.get("ar").cloned().unwrap_or_else(|| "0".to_string());
+    let display_mode = raw_params.get("dm").cloned().unwrap_or_else(|| "0".to_string());
+
+    let mut favorite_names = Vec::new();
+    for i in 0..10 {
+        let key = format!("fn{}", i);
+        let name = raw_params.get(&key).cloned().unwrap_or_else(|| format!("Favorite {}", i));
+        favorite_names.push(name);
+    }
+
+    Ok(EhWebConfig {
+        load_hath,
+        image_size,
+        image_width,
+        image_height,
+        title_display,
+        archiver_settings,
+        display_mode,
+        favorite_names,
+        raw_params,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_gallery_detail, parse_gallery_list};
+    use super::{parse_gallery_detail, parse_gallery_list, parse_eh_web_config};
 
     /// Regression fixture: real front-page HTML captured from e-hentai.org.
     /// Guards against silent parser breakage when the site tweaks its markup.
@@ -641,5 +751,26 @@ mod tests {
         assert!(!detail.title.is_empty());
         assert!(!detail.image_urls.is_empty());
         assert!(!detail.thumbnails.is_empty());
+    }
+
+    #[test]
+    fn parses_uconfig_html() {
+        let sample_html = r#"
+            <form id="outer" action="https://e-hentai.org/uconfig.php" method="post">
+                <input type="radio" name="uh" value="0" checked="checked" />
+                <input type="radio" name="xr" value="1" checked="checked" />
+                <input type="radio" name="lt" value="1" checked="checked" />
+                <input type="text" name="fn0" value="Manga" />
+                <input type="text" name="fn1" value="Doujinshi" />
+                <select name="dm"><option value="2" selected="selected">Thumbnail</option></select>
+            </form>
+        "#;
+        let config = parse_eh_web_config(sample_html).expect("uconfig should parse");
+        assert_eq!(config.load_hath, "0");
+        assert_eq!(config.image_size, "1");
+        assert_eq!(config.title_display, "1");
+        assert_eq!(config.display_mode, "2");
+        assert_eq!(config.favorite_names[0], "Manga");
+        assert_eq!(config.favorite_names[1], "Doujinshi");
     }
 }

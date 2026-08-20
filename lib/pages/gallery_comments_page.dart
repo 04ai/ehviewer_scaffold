@@ -47,6 +47,8 @@ class _GalleryCommentsPageState extends State<GalleryCommentsPage> {
 
   String _key(GalleryComment c) => '${c.author}|${c.time}|${c.content}';
 
+  bool _didPostComment = false;
+
   @override
   void dispose() {
     _commentCtrl.dispose();
@@ -55,32 +57,42 @@ class _GalleryCommentsPageState extends State<GalleryCommentsPage> {
   }
 
   /// 点赞/点踩（EH 评论投票接口）。
-  /// [up] 为 true 用解析出的 vote=1 链接；false 时把链接的 vote 参数改为 -1。
   Future<void> _vote(GalleryComment c, {required bool up}) async {
-    if (c.id == BigInt.zero || c.voteUrl.isEmpty || _voting.contains(c.id)) return;
-    _voting.add(c.id);
+    final keyId = c.id != BigInt.zero ? c.id : BigInt.from(c.hashCode);
+    if (_voting.contains(keyId)) return;
+    if (c.id == BigInt.zero && c.voteUrl.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('该评论暂无法进行点赞/点踩操作')),
+      );
+      return;
+    }
+    _voting.add(keyId);
     try {
-      var url = c.voteUrl;
-      if (!up) {
-        url = url.contains('vote=-1')
-            ? url
-            : url.replaceFirst(RegExp(r'vote=\d+'), 'vote=-1');
+      String url;
+      if (c.voteUrl.isNotEmpty) {
+        url = c.voteUrl;
+        if (up) {
+          url = url.replaceFirst(RegExp(r'vote=-\d+|vote=\d+'), 'vote=1');
+        } else {
+          url = url.replaceFirst(RegExp(r'vote=-\d+|vote=\d+'), 'vote=-1');
+        }
+      } else {
+        url = '/gallerycomments.php?gid=${widget.gid}&t=${widget.token}&act=vote&comment_id=${c.id}&vote=${up ? 1 : -1}';
       }
+
       await voteComment(url: url);
       if (!mounted) return;
       setState(() {
-        // 乐观更新：±1（服务端刷新后才能拿到准确值，重进页面会校正）。
-        _scoreDelta[c.id] = (_scoreDelta[c.id] ?? 0) + (up ? 1 : -1);
-        _voting.remove(c.id);
+        _scoreDelta[keyId] = (_scoreDelta[keyId] ?? 0) + (up ? 1 : -1);
+        _voting.remove(keyId);
       });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(up ? '已点赞' : '已点踩')),
       );
     } catch (e) {
       if (!mounted) return;
-      _voting.remove(c.id);
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('操作失败: $e')));
+      setState(() => _voting.remove(keyId));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('操作失败: $e')));
     }
   }
 
@@ -99,12 +111,28 @@ class _GalleryCommentsPageState extends State<GalleryCommentsPage> {
       await postComment(gid: widget.gid, token: widget.token, content: val);
       if (!mounted) return;
       _commentCtrl.clear();
-      setState(() => _replyTo = null);
+      FocusManager.instance.primaryFocus?.unfocus();
+      setState(() {
+        _replyTo = null;
+        _didPostComment = true;
+      });
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('评论发布成功')));
+      _refreshComments();
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('评论失败: $e')));
     }
+  }
+
+  Future<void> _refreshComments() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+      _page = 0;
+      _comments.clear();
+      _seen.clear();
+    });
+    await _loadMore();
   }
 
   Future<void> _loadMore() async {
@@ -148,143 +176,150 @@ class _GalleryCommentsPageState extends State<GalleryCommentsPage> {
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('全部评论 (${_comments.length})',
-            style: TextStyle(color: colorScheme.onSurface)),
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _comments.isEmpty && _loading
-                ? const Center(child: CircularProgressIndicator())
-                : ListView.builder(
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    itemCount: _comments.length + 1,
-                    itemBuilder: (context, index) {
-                      if (index == _comments.length) {
-                        if (_error != null) {
-                          return Padding(
-                            padding: const EdgeInsets.all(16),
-                            child: Center(
-                              child: Text(_error!,
-                                  style: TextStyle(color: colorScheme.error, fontSize: 13)),
-                            ),
-                          );
-                        }
-                        if (!_hasMore) {
-                          return Padding(
-                            padding: const EdgeInsets.all(16),
-                            child: Center(
-                              child: Text('没有更多评论了',
-                                  style: TextStyle(
-                                      color: colorScheme.onSurface.withOpacity(0.4),
-                                      fontSize: 13)),
-                            ),
-                          );
-                        }
-                        return Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Center(
-                            child: _loading
-                                ? const CircularProgressIndicator()
-                                : TextButton.icon(
-                                    onPressed: _loadMore,
-                                    icon: const Icon(Icons.expand_more),
-                                    label: const Text('加载更多评论'),
-                                  ),
-                          ),
-                        );
-                      }
-
-                      final c = _comments[index];
-                      final canVote = c.id != BigInt.zero && c.voteUrl.isNotEmpty;
-                      final voting = _voting.contains(c.id);
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    c.author,
+    return PopScope(
+      canPop: true,
+      onPopInvoked: (didPop) {},
+      child: Scaffold(
+        appBar: AppBar(
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.pop(context, _didPostComment),
+          ),
+          title: Text('全部评论 (${_comments.length})',
+              style: TextStyle(color: colorScheme.onSurface)),
+        ),
+        body: Column(
+          children: [
+            Expanded(
+              child: _comments.isEmpty && _loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : ListView.builder(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      itemCount: _comments.length + 1,
+                      itemBuilder: (context, index) {
+                        if (index == _comments.length) {
+                          if (_error != null) {
+                            return Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Center(
+                                child: Text(_error!,
+                                    style: TextStyle(color: colorScheme.error, fontSize: 13)),
+                              ),
+                            );
+                          }
+                          if (!_hasMore) {
+                            return Padding(
+                              padding: const EdgeInsets.all(16),
+                              child: Center(
+                                child: Text('没有更多评论了',
                                     style: TextStyle(
-                                      fontWeight: FontWeight.bold,
-                                      color: colorScheme.onSurface.withOpacity(0.6),
+                                        color: colorScheme.onSurface.withOpacity(0.4),
+                                        fontSize: 13)),
+                              ),
+                            );
+                          }
+                          return Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Center(
+                              child: _loading
+                                  ? const CircularProgressIndicator()
+                                  : TextButton.icon(
+                                      onPressed: _loadMore,
+                                      icon: const Icon(Icons.expand_more),
+                                      label: const Text('加载更多评论'),
+                                    ),
+                            ),
+                          );
+                        }
+
+                        final c = _comments[index];
+                        final keyId = c.id != BigInt.zero ? c.id : BigInt.from(c.hashCode);
+                        final voting = _voting.contains(keyId);
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      c.author,
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        color: colorScheme.onSurface.withOpacity(0.6),
+                                      ),
                                     ),
                                   ),
-                                ),
-                                Text(
-                                  c.time,
-                                  style: TextStyle(
-                                    color: colorScheme.onSurface.withOpacity(0.4),
-                                    fontSize: 12,
+                                  Text(
+                                    c.time,
+                                    style: TextStyle(
+                                      color: colorScheme.onSurface.withOpacity(0.4),
+                                      fontSize: 12,
+                                    ),
                                   ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 4),
-                            Text(c.content, style: TextStyle(color: colorScheme.onSurface)),
-                            const SizedBox(height: 6),
-                            // 评分 + 赞/踩 + 回复（与 E-Hentai 评论同步）
-                            Row(
-                              children: [
-                                IconButton(
-                                  visualDensity: VisualDensity.compact,
-                                  iconSize: 18,
-                                  icon: voting
-                                      ? const SizedBox(
-                                          width: 14, height: 14,
-                                          child: CircularProgressIndicator(strokeWidth: 2))
-                                      : Icon(Icons.thumb_up_outlined,
-                                          color: colorScheme.onSurface.withOpacity(0.6)),
-                                  tooltip: '点赞',
-                                  onPressed: canVote && !voting
-                                      ? () => _vote(c, up: true)
-                                      : null,
-                                ),
-                                Text(
-                                  '${c.score + (_scoreDelta[c.id] ?? 0)}',
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                    color: (c.score + (_scoreDelta[c.id] ?? 0)) > 0
-                                        ? Colors.green
-                                        : ((c.score + (_scoreDelta[c.id] ?? 0)) < 0
-                                            ? colorScheme.error
-                                            : colorScheme.onSurface.withOpacity(0.6)),
-                                  ),
-                                ),
-                                IconButton(
-                                  visualDensity: VisualDensity.compact,
-                                  iconSize: 18,
-                                  icon: Icon(Icons.thumb_down_outlined,
-                                      color: colorScheme.onSurface.withOpacity(0.6)),
-                                  tooltip: '点踩',
-                                  onPressed: canVote && !voting
-                                      ? () => _vote(c, up: false)
-                                      : null,
-                                ),
-                                const Spacer(),
-                                TextButton.icon(
-                                  style: TextButton.styleFrom(
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(c.content, style: TextStyle(color: colorScheme.onSurface)),
+                              const SizedBox(height: 6),
+                              // 评分 + 赞/踩 + 回复（与 E-Hentai 评论同步）
+                              Row(
+                                children: [
+                                  IconButton(
                                     visualDensity: VisualDensity.compact,
-                                    foregroundColor: colorScheme.onSurface.withOpacity(0.5),
+                                    iconSize: 18,
+                                    icon: voting
+                                        ? const SizedBox(
+                                            width: 14, height: 14,
+                                            child: CircularProgressIndicator(strokeWidth: 2))
+                                        : Icon(Icons.thumb_up_outlined,
+                                            color: colorScheme.onSurface.withOpacity(0.6)),
+                                    tooltip: '点赞',
+                                    onPressed: !voting
+                                        ? () => _vote(c, up: true)
+                                        : null,
                                   ),
-                                  onPressed: () => _startReply(c),
-                                  icon: const Icon(Icons.reply, size: 15),
-                                  label: const Text('回复', style: TextStyle(fontSize: 12)),
-                                ),
-                              ],
-                            ),
-                            Divider(color: colorScheme.onSurface.withOpacity(0.08), height: 1),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
+                                  Text(
+                                    '${c.score + (_scoreDelta[keyId] ?? 0)}',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600,
+                                      color: (c.score + (_scoreDelta[keyId] ?? 0)) > 0
+                                          ? Colors.green
+                                          : ((c.score + (_scoreDelta[keyId] ?? 0)) < 0
+                                              ? colorScheme.error
+                                              : colorScheme.onSurface.withOpacity(0.6)),
+                                    ),
+                                  ),
+                                  IconButton(
+                                    visualDensity: VisualDensity.compact,
+                                    iconSize: 18,
+                                    icon: Icon(Icons.thumb_down_outlined,
+                                        color: colorScheme.onSurface.withOpacity(0.6)),
+                                    tooltip: '点踩',
+                                    onPressed: !voting
+                                        ? () => _vote(c, up: false)
+                                        : null,
+                                  ),
+                                  const Spacer(),
+                                  TextButton.icon(
+                                    style: TextButton.styleFrom(
+                                      visualDensity: VisualDensity.compact,
+                                      foregroundColor: colorScheme.onSurface.withOpacity(0.5),
+                                    ),
+                                    onPressed: () => _startReply(c),
+                                    icon: const Icon(Icons.reply, size: 15),
+                                    label: const Text('回复', style: TextStyle(fontSize: 12)),
+                                  ),
+                                ],
+                              ),
+                              Divider(color: colorScheme.onSurface.withOpacity(0.08), height: 1),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
           ),
           // 底部评论输入栏（回复时预填 @作者）
           SafeArea(
@@ -325,6 +360,7 @@ class _GalleryCommentsPageState extends State<GalleryCommentsPage> {
           ),
         ],
       ),
-    );
-  }
+    ),
+  );
+}
 }

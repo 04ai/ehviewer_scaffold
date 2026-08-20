@@ -10,6 +10,7 @@ import 'settings/advanced_settings_page.dart';
 import 'settings/security_settings_page.dart';
 import 'settings/search_settings_page.dart';
 import 'settings/about_settings_page.dart';
+import 'settings/eh_web_settings_page.dart';
 
 import '../providers/settings_provider.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -109,6 +110,18 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   Navigator.push(
                     context,
                     CupertinoPageRoute(builder: (_) => const CookieLoginPage()),
+                  );
+                },
+              ),
+              const Divider(height: 1, indent: 16),
+              _SettingsRow(
+                title: 'E-Hentai 网站设置',
+                subtitle: '在线管理 H@H、图片分辨率、标题等 (uconfig.php)',
+                isLink: true,
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    CupertinoPageRoute(builder: (_) => const EhWebSettingsPage()),
                   );
                 },
               ),
