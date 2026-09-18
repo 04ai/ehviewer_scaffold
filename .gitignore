@@ -46,6 +46,9 @@ migrate_working_dir/
 
 # Android gradle 构建产物
 /android/build/
+/android/app/build/
+/android/.gradle/
+/android/local.properties
 
 # 测试输出报告
 /test_*.html

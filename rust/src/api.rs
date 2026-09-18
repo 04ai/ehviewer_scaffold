@@ -1,16 +1,17 @@
 use anyhow::Result;
-use flutter_rust_bridge::DartFnFuture;
 use crate::network::NetworkClient;
 use crate::parser::{GalleryItem, GalleryDetail, EhWebConfig};
 use crate::cache::CacheEngine;
 use lazy_static::lazy_static;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 lazy_static! {
     static ref NETWORK_CLIENT: Arc<NetworkClient> = Arc::new(NetworkClient::new());
-    static ref CACHE_ENGINE: Arc<Mutex<CacheEngine>> =
-        Arc::new(Mutex::new(CacheEngine::new(100, "./.cache".to_string())));
+    /// Global image cache — `Arc<CacheEngine>` with interior mutability.
+    /// No outer Mutex: concurrent tasks share this reference directly and
+    /// contend only on the µs-scale std::Mutex<MemCache> inside CacheEngine.
+    static ref CACHE_ENGINE: Arc<CacheEngine> =
+        Arc::new(CacheEngine::new("./.cache".to_string()));
 }
 
 /// A basic health check to ensure Dart <-> Rust FFI is working
@@ -23,10 +24,9 @@ pub async fn health_check(name: String) -> String {
 /// the built-in hosts feature was removed (DNS is used as-is).
 pub async fn init_backend(cache_dir: String, enable_eh_host: bool) -> Result<()> {
     let _ = enable_eh_host; // kept for API compatibility, no longer used
-    let mut cache = CACHE_ENGINE.lock().await;
-    cache.set_disk_path(cache_dir.clone());
-    cache.init_disk_cache().await?;
-    drop(cache); // release lock before async network ops
+    // CacheEngine uses interior mutability — no outer lock needed.
+    CACHE_ENGINE.set_disk_path(cache_dir.clone());
+    CACHE_ENGINE.init_disk_cache().await?;
 
     // Downloads live beside the HTTP cache dir (its parent), NOT inside it,
     // so the periodic cache auto-clear can wipe image cache files while the
@@ -44,6 +44,12 @@ pub async fn init_backend(cache_dir: String, enable_eh_host: bool) -> Result<()>
 /// Sync cookies from Flutter WebView to Rust Reqwest client
 pub async fn sync_cookies(cookie_string: String) -> Result<()> {
     NETWORK_CLIENT.update_cookies(&cookie_string).await?;
+    Ok(())
+}
+
+/// Set user agent string dynamically from Android WebView
+pub async fn set_user_agent(user_agent: String) -> Result<()> {
+    NETWORK_CLIENT.update_user_agent(&user_agent).await;
     Ok(())
 }
 
@@ -69,12 +75,10 @@ pub async fn load_tag_db(path: String) -> Result<()> {
     crate::tag_translator::load_tag_db(path).await
 }
 
-#[flutter_rust_bridge::frb(sync)]
 pub fn translate_tag_sync(namespace: String, tag: String) -> String {
     crate::tag_translator::translate_tag_sync(namespace, tag)
 }
 
-#[flutter_rust_bridge::frb(sync)]
 pub fn search_tag_by_chinese(keyword: String) -> Vec<crate::tag_translator::TagSuggestion> {
     crate::tag_translator::search_tag_by_chinese(keyword)
 }
@@ -118,7 +122,7 @@ pub async fn fetch_front_page(query: Option<String>, options: Option<SearchOptio
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchOptions {
     pub f_sname: bool,
     pub f_stags: bool,
@@ -274,54 +278,48 @@ pub async fn get_image(url: String) -> Result<Vec<u8>> {
 /// progress via [on_progress], called with `(downloaded_bytes, total_bytes)`
 /// after each received chunk. `total` is `None` when the server omits
 /// Content-Length. Cache hits report instant 100% completion.
-pub async fn get_image_with_progress(
+pub async fn get_image_with_progress<F, Fut>(
     url: String,
-    on_progress: impl Fn(u64, Option<u64>) -> DartFnFuture<()> + Send + 'static,
-) -> Result<Vec<u8>> {
+    on_progress: F,
+) -> Result<Vec<u8>>
+where
+    F: Fn(u64, Option<u64>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     // L1 + L2: memory / disk cache hit → complete instantly.
-    {
-        let c = CACHE_ENGINE.lock().await;
-        if let Some(bytes) = c.get_cached(&url).await? {
-            on_progress(bytes.len() as u64, Some(bytes.len() as u64)).await;
-            return Ok(bytes.to_vec());
-        }
+    if let Some(bytes) = CACHE_ENGINE.get_cached(&url).await? {
+        on_progress(bytes.len() as u64, Some(bytes.len() as u64)).await;
+        return Ok(bytes.to_vec());
     }
 
-    // L3: network fetch, reporting progress chunk-by-chunk (lock released).
+    // L3: network fetch, reporting progress chunk-by-chunk.
     let bytes = NETWORK_CLIENT
         .get_bytes_with_progress(&url, on_progress)
         .await?;
 
     // Persist to memory + disk (HTML error bodies are rejected inside store()).
-    {
-        let c = CACHE_ENGINE.lock().await;
-        let _ = c.store(&url, &bytes).await;
-    }
+    let _ = CACHE_ENGINE.store(&url, &bytes).await;
 
     Ok(bytes)
 }
 
+/// L1 + L2 + L3 cache-aware fetch.
+/// `cache` is `&Arc<CacheEngine>` — no outer lock; CacheEngine is self-synchronizing.
 async fn fetch_image_cached(
     url: &str,
-    cache: &Arc<Mutex<CacheEngine>>,
+    cache: &Arc<CacheEngine>,
     network: &Arc<NetworkClient>,
 ) -> Result<Vec<u8>> {
-    // L1 + L2: memory / disk cache hit
-    {
-        let c = cache.lock().await;
-        if let Some(bytes) = c.get_cached(url).await? {
-            return Ok(bytes.to_vec());
-        }
+    // L1 + L2: memory / disk hit (no outer lock — CacheEngine is self-synchronizing)
+    if let Some(bytes) = cache.get_cached(url).await? {
+        return Ok(bytes.to_vec());
     }
 
-    // L3: Network fetch (lock released)
+    // L3: network fetch (fully concurrent — no cache lock held during I/O)
     let bytes = network.get_bytes(url).await?;
 
     // Persist to memory + disk (HTML error bodies are rejected inside store())
-    {
-        let c = cache.lock().await;
-        let _ = c.store(url, &bytes).await;
-    }
+    let _ = cache.store(url, &bytes).await;
 
     Ok(bytes)
 }
@@ -342,6 +340,86 @@ fn error_items(msg: String) -> Vec<GalleryItem> {
 pub async fn resolve_image_url(viewer_url: String) -> Result<String> {
     let html = NETWORK_CLIENT.get_html(&viewer_url).await?;
     crate::parser::parse_image_url(&html)
+}
+
+/// Unified reader image pipeline entry point.
+///
+/// Flow:
+///   1. Resolve viewer page URL → real CDN image URL
+///   2. Attempt fetch via `reqwest` (same session + UA + proxy as the rest of Rust)
+///   3. On 509 quota / 403 / HTML error body → parse `nl` reload param and retry once
+///   4. Write bytes to Disk LRU cache (md5-keyed file under app cache dir)
+///   5. Return `file://` absolute path so Coil can decode locally without touching the network
+///
+/// This makes Coil act as a pure local decoder: all EH-specific session management
+/// (cookies, UA, proxy, nl-retry) is handled exclusively by the Rust network layer.
+pub async fn fetch_and_cache_image(viewer_url: String) -> Result<String> {
+    // Step 1: resolve viewer page → real image URL
+    let real_url = resolve_image_url(viewer_url.clone()).await?;
+
+    // Step 2: check disk cache first (avoid re-downloading already-fetched images)
+    // get_disk_file_path acquires a ns-scale read-lock internally; no outer lock needed.
+    let cache_file = CACHE_ENGINE.get_disk_file_path(&real_url);
+
+    if cache_file.exists() {
+        return Ok(format!("file://{}", cache_file.to_string_lossy()));
+    }
+
+    // Step 3: fetch with nl-retry on quota/stale-key errors
+    let bytes = fetch_with_nl_retry(&real_url, &viewer_url).await?;
+
+    // Step 4: persist to LRU disk cache (store is self-synchronizing, no outer lock)
+    let _ = CACHE_ENGINE.store(&real_url, &bytes).await;
+
+    // Step 5: return file:// URI so Coil reads from disk
+    Ok(format!("file://{}", cache_file.to_string_lossy()))
+}
+
+/// Fetch image bytes from the real URL, retrying with an `nl` reload parameter
+/// when the server returns a quota-exceeded / stale-key error response.
+///
+/// E-Hentai returns HTTP 200 with an HTML error page or a redirect for expired
+/// image keys. We detect the HTML body and re-resolve via `?nl=1` which forces
+/// the server to issue a new image key assignment.
+async fn fetch_with_nl_retry(real_url: &str, viewer_url: &str) -> Result<Vec<u8>> {
+    // First attempt
+    match NETWORK_CLIENT.get_bytes(real_url).await {
+        Ok(b) if !b.is_empty() && !b.starts_with(b"<") => return Ok(b),
+        Ok(_) | Err(_) => {
+            log::warn!(
+                "fetch_with_nl_retry: first attempt failed or returned HTML for {}; retrying with nl=1",
+                real_url
+            );
+        }
+    }
+
+    // nl=1 retry: re-resolve with the reload parameter so EH issues a fresh image key
+    let nl_url = append_nl_param(viewer_url);
+    let html = NETWORK_CLIENT.get_html(&nl_url).await
+        .map_err(|e| anyhow::anyhow!("nl-retry: failed to reload viewer page: {}", e))?;
+    let new_real_url = crate::parser::parse_image_url(&html)
+        .map_err(|e| anyhow::anyhow!("nl-retry: failed to parse new image URL: {}", e))?;
+
+    let bytes = NETWORK_CLIENT.get_bytes(&new_real_url).await
+        .map_err(|e| anyhow::anyhow!("nl-retry: failed to fetch new image URL {}: {}", new_real_url, e))?;
+
+    if bytes.is_empty() || bytes.starts_with(b"<") {
+        return Err(anyhow::anyhow!("nl-retry: still got HTML/empty after reload — image may be unavailable"));
+    }
+
+    // Cache under the new real URL so future requests skip the viewer page.
+    let _ = CACHE_ENGINE.store(&new_real_url, &bytes).await;
+
+    Ok(bytes)
+}
+
+/// Appends `nl=1` reload parameter to a viewer URL.
+fn append_nl_param(viewer_url: &str) -> String {
+    if viewer_url.contains('?') {
+        format!("{}&nl=1", viewer_url)
+    } else {
+        format!("{}?nl=1", viewer_url)
+    }
 }
 
 /// Collect the full viewer-URL list for a gallery by walking every ?p=N page,
@@ -424,8 +502,15 @@ pub async fn get_download_dir() -> Option<String> {
 /// gallery finishes: the pages are persisted in the download directory, so
 /// their duplicate copies in the L1/L2 cache can be dropped.
 pub(crate) async fn evict_image_cache(url: String) {
-    let cache = CACHE_ENGINE.lock().await;
-    let _ = cache.remove(&url).await;
+    // CacheEngine is self-synchronizing — call directly without outer lock.
+    let _ = CACHE_ENGINE.remove(&url).await;
+}
+
+/// Delete disk cache files older than `days` days and flush L1 memory cache.
+/// Called by the Kotlin advanced settings "auto-clean" action.
+/// Returns the number of bytes freed.
+pub async fn clear_expired_cache(days: u32) -> anyhow::Result<u64> {
+    CACHE_ENGINE.clear_expired(days as u64).await
 }
 
 /// Fetch the torrent list for a gallery (/gallerytorrents.php popup).
@@ -625,6 +710,82 @@ pub async fn add_watched_tag(tag: String) -> Result<String> {
         Ok(format!("已关注标签: {}", tag))
     } else {
         Ok(format!("标签已在关注列表中: {}", tag))
+    }
+}
+
+/// Remove a tag from the account's watched tags (My Tags).
+pub async fn remove_watched_tag(tag: String) -> Result<String> {
+    let site_url = NETWORK_CLIENT.get_site_url().await;
+    let url = format!("{}/mytags", site_url);
+    let html = NETWORK_CLIENT.get_html(&url).await?;
+    if html.contains("requires you to log on") {
+        anyhow::bail!("需要先登录 E-Hentai 账号才能管理标签");
+    }
+
+    let (fields, post_url, watch_updated) = {
+        let document = scraper::Html::parse_document(&html);
+        let form_sel = scraper::Selector::parse("form").unwrap();
+        let input_sel = scraper::Selector::parse("input").unwrap();
+        let textarea_sel = scraper::Selector::parse("textarea").unwrap();
+
+        let Some(form) = document.select(&form_sel).next() else {
+            anyhow::bail!("无法解析 My Tags 页面");
+        };
+
+        let mut fields: Vec<(String, String)> = Vec::new();
+        let mut watch_updated = false;
+
+        for textarea in form.select(&textarea_sel) {
+            let name = textarea.value().attr("name").unwrap_or_default().to_string();
+            let mut value = textarea.text().collect::<String>();
+            if name == "watch_list" {
+                let trimmed = value.trim().to_string();
+                let remaining: Vec<&str> = trimmed.lines().filter(|l| l.trim() != tag).collect();
+                if remaining.len() != trimmed.lines().count() {
+                    value = remaining.join("\n");
+                    watch_updated = true;
+                }
+            }
+            fields.push((name, value));
+        }
+
+        for input in form.select(&input_sel) {
+            let name = input.value().attr("name").unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let typ = input.value().attr("type").unwrap_or("text");
+            if matches!(typ, "submit" | "button" | "reset" | "image") {
+                continue;
+            }
+            if matches!(typ, "checkbox" | "radio") && input.value().attr("checked").is_none() {
+                continue;
+            }
+            fields.push((name.to_string(), input.value().attr("value").unwrap_or_default().to_string()));
+        }
+
+        let action = form.value().attr("action").unwrap_or("mytags");
+        let post_url = if action.starts_with("http") {
+            action.to_string()
+        } else if action.starts_with('/') {
+            format!("{}{}", site_url, action)
+        } else {
+            format!("{}/{}", site_url, action)
+        };
+
+        (fields, post_url, watch_updated)
+    };
+
+    let form_fields: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let res = NETWORK_CLIENT.post_form(&post_url, &form_fields).await?;
+    if res.contains("requires you to log on") {
+        anyhow::bail!("取消关注失败：会话已失效，请重新登录");
+    }
+
+    if watch_updated {
+        Ok(format!("已取消关注标签: {}", tag))
+    } else {
+        Ok(format!("标签不在关注列表中: {}", tag))
     }
 }
 

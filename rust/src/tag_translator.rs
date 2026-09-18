@@ -28,17 +28,16 @@ struct TagData {
 
 /// A raw E-Hentai tag matched by its Chinese translation, e.g.
 /// raw "parody:genshin impact" translated "原神".
-#[derive(Debug, Clone)]
-#[flutter_rust_bridge::frb]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TagSuggestion {
     pub raw: String,
     pub translated: String,
 }
 
-/// Reverse-search the loaded tag database: given a keyword (usually a Chinese
-/// translation like "原神"), return raw E-Hentai tags whose translated name
-/// contains the keyword, e.g. "parody:genshin impact".
-#[flutter_rust_bridge::frb(sync)]
+
+
+/// Reverse-search the tag database and common tags: given a keyword in Chinese or
+/// English, return matching raw E-Hentai tags with Chinese translations.
 pub fn search_tag_by_chinese(keyword: String) -> Vec<TagSuggestion> {
     let kw = keyword.trim().to_lowercase();
     if kw.is_empty() {
@@ -46,33 +45,47 @@ pub fn search_tag_by_chinese(keyword: String) -> Vec<TagSuggestion> {
     }
 
     let mut results: Vec<(u8, TagSuggestion)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // 1. Search loaded database
     if let Ok(db) = TAG_DB.try_read() {
         for (ns, tags) in db.iter() {
             for (tag, translated) in tags.iter() {
                 let t = translated.to_lowercase();
-                if let Some(pos) = t.find(&kw) {
-                    let rank = if t == kw {
+                let tag_lower = tag.to_lowercase();
+                let raw = if ns.is_empty() {
+                    tag.clone()
+                } else {
+                    format!("{}:{}", ns, tag)
+                };
+                let raw_lower = raw.to_lowercase();
+
+                let matched_t = t.find(&kw);
+                let matched_tag = tag_lower.find(&kw);
+                let matched_raw = raw_lower.find(&kw);
+
+                if matched_t.is_some() || matched_tag.is_some() || matched_raw.is_some() {
+                    let rank = if t == kw || tag_lower == kw || raw_lower == kw {
                         0
-                    } else if t.starts_with(&kw) {
+                    } else if t.starts_with(&kw) || tag_lower.starts_with(&kw) || raw_lower.starts_with(&kw) {
                         1
-                    } else if pos == 0 {
+                    } else if matched_t == Some(0) || matched_tag == Some(0) || matched_raw == Some(0) {
                         1
                     } else {
                         2
                     };
-                    let raw = if ns.is_empty() {
-                        tag.clone()
-                    } else {
-                        format!("{}:{}", ns, tag)
-                    };
-                    results.push((rank, TagSuggestion { raw, translated: translated.clone() }));
+                    if seen.insert(raw.clone()) {
+                        results.push((rank, TagSuggestion { raw, translated: translated.clone() }));
+                    }
                 }
             }
         }
     }
 
+
+
     results.sort_by(|a, b| a.0.cmp(&b.0));
-    results.truncate(10);
+    results.truncate(12);
     results.into_iter().map(|(_, s)| s).collect()
 }
 
@@ -119,39 +132,30 @@ pub async fn load_tag_db(path: String) -> Result<()> {
     Ok(())
 }
 
-/// Translate a tag synchronously. Fast memory lookup.
-#[flutter_rust_bridge::frb(sync)]
+/// Translate a tag synchronously. Fast memory lookup with common tag fallback.
 pub fn translate_tag_sync(namespace: String, tag: String) -> String {
-    // We use a try_read because it's a sync function and we don't want to block the thread
-    // if it's currently writing. If it's locked, just return original.
+    let ns = namespace.trim();
+    let t = tag.trim();
+
+    // 1. Precise memory lookup from loaded DB
     if let Ok(db) = TAG_DB.try_read() {
-        // e-hentai sometimes sends empty namespaces or short names
-        let ns = namespace.trim();
-        let t = tag.trim();
-        
-        // Map common namespaces if needed, usually they match
-        // EhTagTranslation uses: rows, reclass, language, parody, character, group, artist, cosplay, male, female, mixed, other
-        let mapped_ns = match ns {
-            "rows" | "" => None,
-            _ => Some(ns),
-        };
-        
-        // Try precise match
-        if let Some(n) = mapped_ns {
-            if let Some(ns_map) = db.get(n) {
+        let has_ns = !matches!(ns, "rows" | "");
+        if has_ns {
+            if let Some(ns_map) = db.get(ns) {
+                if let Some(translated) = ns_map.get(t) {
+                    return translated.clone();
+                }
+            }
+        } else {
+            for ns_map in db.values() {
                 if let Some(translated) = ns_map.get(t) {
                     return translated.clone();
                 }
             }
         }
-        
-        // Try fuzzy match in "other" or "mixed" or without namespace
-        for ns_map in db.values() {
-            if let Some(translated) = ns_map.get(t) {
-                return translated.clone();
-            }
-        }
     }
-    
+
+
+
     tag // fallback to original
 }

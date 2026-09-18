@@ -1,17 +1,20 @@
 use anyhow::Result;
-use lru::LruCache;
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
-use tokio::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::fs;
 
-/// Upper bound on total bytes held in the in-memory (L1) cache.
-/// Kept modest so low-end Android devices don't get OOM-killed;
-/// individual images larger than this are skipped (not cached).
-const MAX_MEM_CACHE_BYTES: usize = 96 * 1024 * 1024;
+// ─── Capacity Constants ───────────────────────────────────────────────────────
 
-/// Cheap guard: refuse to cache bodies that look like an HTML error page
-/// (e.g. a Cloudflare/403 challenge that slips through with status 200).
+
+/// Maximum total size of on-disk (L2) cached image files.
+/// Files are evicted in LRU order (oldest mtime first) when exceeded.
+/// Eviction runs asynchronously after each write so it never delays the caller.
+const MAX_DISK_CACHE_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
+
+// ─── HTML Error Guard ─────────────────────────────────────────────────────────
+
+/// Refuse to cache bodies that look like an HTML error page
+/// (e.g. a Cloudflare / 403 challenge that slips through with HTTP 200).
 fn looks_like_html_error(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return true;
@@ -25,124 +28,198 @@ fn looks_like_html_error(bytes: &[u8]) -> bool {
     false
 }
 
-/// L1 (memory) cache: LRU with a byte-based budget.
-struct MemCache {
-    entries: LruCache<String, Arc<Vec<u8>>>,
-    total_bytes: usize,
-}
 
-impl MemCache {
-    fn get(&mut self, url: &str) -> Option<Arc<Vec<u8>>> {
-        self.entries.get(url).cloned()
-    }
+// ─── CacheEngine ─────────────────────────────────────────────────────────────
 
-    fn put(&mut self, url: String, bytes: Arc<Vec<u8>>) {
-        let size = bytes.len();
-        if size > MAX_MEM_CACHE_BYTES {
-            return;
-        }
-        if let Some(evicted) = self.entries.put(url, bytes) {
-            self.total_bytes = self.total_bytes.saturating_sub(evicted.len());
-        }
-        self.total_bytes += size;
-        while self.total_bytes > MAX_MEM_CACHE_BYTES {
-            match self.entries.pop_lru() {
-                Some((_, ev)) => self.total_bytes = self.total_bytes.saturating_sub(ev.len()),
-                None => break,
-            }
-        }
-    }
-
-    fn pop(&mut self, url: &str) -> Option<Arc<Vec<u8>>> {
-        let evicted = self.entries.pop(url)?;
-        self.total_bytes = self.total_bytes.saturating_sub(evicted.len());
-        Some(evicted)
-    }
-}
-
+/// Two-level image cache with **interior mutability** — no outer `Mutex` needed.
+///
+/// ## Layers
+/// - **L2 (disk)**: MD5-keyed files under `disk_path`, with a 512 MB LRU
+///   eviction policy enforced asynchronously in a background task after every
+///   `store()` call.
+///
+/// ## Concurrency
+/// `CacheEngine` wraps in `Arc<CacheEngine>` with zero outer synchronization.
+/// Disk reads and writes run fully concurrently with no lock held.
 pub struct CacheEngine {
-    disk_path: PathBuf,
-    mem_cache: Mutex<MemCache>,
+    /// Base directory for L2 disk files.
+    /// `std::sync::RwLock` because `set_disk_path` is only called once at init
+    /// (very brief exclusive lock), and every subsequent call is a shared read.
+    disk_path: std::sync::RwLock<PathBuf>,
 }
 
 impl CacheEngine {
-    pub fn new(capacity: usize, disk_path: String) -> Self {
-        let capacity = NonZeroUsize::new(capacity.max(1)).unwrap();
+    /// Create a new CacheEngine.  The `disk_path` can be updated later via
+    /// [`set_disk_path`] before any reads/writes are issued.
+    pub fn new(disk_path: String) -> Self {
         Self {
-            disk_path: PathBuf::from(disk_path),
-            mem_cache: Mutex::new(MemCache {
-                entries: LruCache::new(capacity),
-                total_bytes: 0,
-            }),
+            disk_path: std::sync::RwLock::new(PathBuf::from(disk_path)),
         }
     }
 
+    /// Create the L2 disk cache directory if it does not already exist.
     pub async fn init_disk_cache(&self) -> Result<()> {
-        if !self.disk_path.exists() {
-            fs::create_dir_all(&self.disk_path).await?;
+        let path = self.disk_path.read().unwrap().clone();
+        if !path.exists() {
+            fs::create_dir_all(&path).await?;
         }
         Ok(())
     }
 
-    pub fn set_disk_path(&mut self, path: String) {
-        self.disk_path = PathBuf::from(path);
+    /// Update the L2 disk cache base directory (called once during init).
+    pub fn set_disk_path(&self, path: String) {
+        *self.disk_path.write().unwrap() = PathBuf::from(path);
     }
 
-    fn get_disk_file_path(&self, url: &str) -> PathBuf {
+    /// Compute the disk file path for a given URL (hash of the URL bytes).
+    /// The `std::RwLock` read is held only for the `PathBuf::join` call (ns-scale).
+    pub fn get_disk_file_path(&self, url: &str) -> PathBuf {
         let file_name = format!("{:x}", md5::compute(url.as_bytes()));
-        self.disk_path.join(file_name)
+        self.disk_path.read().unwrap().join(file_name)
     }
 
-    /// L1 (memory) + L2 (disk) cache lookup.
-    /// Network access is intentionally NOT performed while holding the
-    /// global cache lock, so slow fetches cannot block other image loads.
+    /// Disk cache lookup.
+    /// Disk I/O runs with **no lock held**, so a slow read never blocks others.
     pub async fn get_cached(&self, url: &str) -> Result<Option<Arc<Vec<u8>>>> {
-        if let Some(bytes) = self.mem_cache.lock().unwrap_or_else(|e| e.into_inner()).get(url) {
-            return Ok(Some(bytes));
-        }
-
+        // L2: disk — path computed under a brief ns-scale read-lock, then all I/O is lock-free.
         let disk_file = self.get_disk_file_path(url);
         if disk_file.exists() {
+            // Read from disk with no lock held.
             let bytes = Arc::new(fs::read(&disk_file).await?);
-            self.mem_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .put(url.to_string(), bytes.clone());
             return Ok(Some(bytes));
         }
 
         Ok(None)
     }
 
-    /// Persist fetched bytes to memory + disk. HTML error pages are never
-    /// cached so a transient failure cannot poison the cache and break
-    /// future retries.
+    /// Persist fetched bytes to disk.
+    ///
+    /// HTML error pages are silently dropped so a transient failure cannot
+    /// poison the cache and break future retries.
+    ///
+    /// The write runs fully lock-free. After the write, disk LRU eviction is
+    /// spawned as a fire-and-forget task.
     pub async fn store(&self, url: &str, bytes: &[u8]) -> Result<()> {
         if looks_like_html_error(bytes) {
             return Ok(());
         }
-        let arc = Arc::new(bytes.to_vec());
-        self.mem_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .put(url.to_string(), arc);
+
+        // L2: disk write (no lock held — concurrent stores do not block each other)
         let disk_file = self.get_disk_file_path(url);
         fs::write(&disk_file, bytes).await?;
+
+        // Enforce the disk size budget asynchronously.
+        // Clone the path while holding the read-lock for ns; then release.
+        let disk_root = self.disk_path.read().unwrap().clone();
+        tokio::spawn(async move {
+            if let Err(e) = evict_disk_lru(&disk_root, MAX_DISK_CACHE_BYTES).await {
+                log::warn!("Disk LRU eviction error: {}", e);
+            }
+        });
+
         Ok(())
     }
 
-    /// Drop a URL from both L1 (memory) and L2 (disk).
-    /// Used after a download completes: the images are safe on disk in the
-    /// download directory, so their duplicate HTTP-cache copies can go.
+    /// Clear disk cache files older than `older_than_days` days.
+    /// This is called from Kotlin's advanced settings "auto-clean" feature.
+    pub async fn clear_expired(&self, older_than_days: u64) -> Result<u64> {
+        let disk_root = self.disk_path.read().unwrap().clone();
+        let threshold_secs = older_than_days * 24 * 3600;
+        let now = std::time::SystemTime::now();
+        let mut freed_bytes: u64 = 0;
+        let mut dir_iter = match fs::read_dir(&disk_root).await {
+            Ok(d) => d,
+            Err(_) => return Ok(0), // cache dir doesn't exist yet — nothing to clear
+        };
+        while let Ok(Some(entry)) = dir_iter.next_entry().await {
+            let meta = match entry.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.is_file() { continue; }
+            let age_secs = now.duration_since(
+                meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            ).map(|d| d.as_secs()).unwrap_or(0);
+            if age_secs >= threshold_secs {
+                let size = meta.len();
+                if fs::remove_file(entry.path()).await.is_ok() {
+                    freed_bytes += size;
+                }
+            }
+        }
+
+        log::info!("clear_expired({}d): freed {} MB", older_than_days, freed_bytes / 1024 / 1024);
+        Ok(freed_bytes)
+    }
+
+    /// Drop a URL from disk.
+    ///
+    /// Called by the downloader after a gallery finishes — downloaded images are
+    /// safe in the download directory, so their duplicate HTTP-cache copies can go.
     pub async fn remove(&self, url: &str) -> Result<()> {
-        self.mem_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop(url);
         let disk_file = self.get_disk_file_path(url);
         if disk_file.exists() {
             fs::remove_file(&disk_file).await?;
         }
         Ok(())
     }
+}
+
+// ─── Disk LRU Eviction ───────────────────────────────────────────────────────
+
+/// Scan `dir` and remove the oldest files (by mtime) until the total size
+/// is at or below `max_bytes * 90%`.  Skips the scan entirely when already
+/// under budget.  Runs in a background [`tokio::spawn`] task — never delays
+/// callers of [`CacheEngine::store`].
+async fn evict_disk_lru(dir: &PathBuf, max_bytes: u64) -> Result<()> {
+    let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total_size: u64 = 0;
+
+    let mut dir_iter = fs::read_dir(dir).await?;
+    while let Some(entry) = dir_iter.next_entry().await? {
+        let meta = entry.metadata().await?;
+        if meta.is_file() {
+            let mtime = meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            total_size += meta.len();
+            entries.push((entry.path(), meta.len(), mtime));
+        }
+    }
+
+    // Fast path: already within budget — nothing to evict.
+    if total_size <= max_bytes {
+        return Ok(());
+    }
+
+    // Sort oldest-first (least recently modified = LRU).
+    entries.sort_unstable_by_key(|(_, _, mtime)| *mtime);
+
+    // Shrink to 90% of limit to amortize future eviction scans.
+    let target = max_bytes / 10 * 9;
+    let mut freed: u64 = 0;
+    for (path, size, _) in entries {
+        if total_size <= target {
+            break;
+        }
+        if let Ok(()) = fs::remove_file(&path).await {
+            total_size = total_size.saturating_sub(size);
+            freed += size;
+            log::info!(
+                "Disk LRU evict: {} KB freed ({:?})",
+                size / 1024,
+                path.file_name().unwrap_or_default()
+            );
+        }
+    }
+
+    if freed > 0 {
+        log::info!(
+            "Disk cache after eviction: {} MB / {} MB cap",
+            total_size / 1024 / 1024,
+            max_bytes / 1024 / 1024
+        );
+    }
+
+    Ok(())
 }

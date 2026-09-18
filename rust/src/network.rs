@@ -20,21 +20,22 @@ pub struct NetworkClient {
     cookie_string: RwLock<String>,
     /// Base site URL: "https://e-hentai.org" or "https://exhentai.org"
     pub site_url: RwLock<String>,
+    /// Dynamic User-Agent synced from Android WebView
+    pub user_agent: RwLock<String>,
 }
 
 impl NetworkClient {
     pub fn new() -> Self {
         Self {
-            client: RwLock::new(Self::build_client()),
+            client: RwLock::new(Self::build_client(USER_AGENT)),
             cookie_string: RwLock::new(String::new()),
             site_url: RwLock::new("https://e-hentai.org".to_string()),
+            user_agent: RwLock::new(USER_AGENT.to_string()),
         }
     }
 
-    /// Build a client using the system DNS resolver as-is.
-    /// (The old built-in hosts / IP-override feature was removed: hardcoded
-    /// IPs went stale and overrode reachable DNS results, breaking images.)
-    fn build_client() -> Client {
+    /// Build a client using the system DNS resolver as-is with specific User-Agent.
+    fn build_client(user_agent: &str) -> Client {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::ACCEPT,
@@ -48,25 +49,36 @@ impl NetworkClient {
 
         Client::builder()
             .default_headers(headers)
-            .user_agent(USER_AGENT)
+            .user_agent(user_agent)
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
             .pool_max_idle_per_host(10)
-            // Generous limits: EH image CDNs (hath.network) are slow and
-            // flaky — 4s connect / 30s total was causing spurious "operation
-            // timed out" failures on large webp files.
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("Failed to build reqwest client")
     }
 
-    /// Rebuild the client (kept for API compatibility; the enable_*_host
-    /// flags from the removed built-in hosts feature are no longer used).
+    /// Rebuild the client using current user_agent
     pub async fn rebuild_client(&self) {
-        let new_client = Self::build_client();
+        let ua = self.user_agent.read().await.clone();
+        let new_client = Self::build_client(&ua);
         let mut c = self.client.write().await;
         *c = new_client;
-        log::info!("Reqwest client rebuilt (system DNS used as-is).");
+        log::info!("Reqwest client rebuilt with User-Agent: {}.", ua);
+    }
+
+    /// Dynamically update User-Agent to match Android WebView exactly
+    pub async fn update_user_agent(&self, ua: &str) {
+        let ua = ua.trim();
+        if ua.is_empty() {
+            return;
+        }
+        let mut u = self.user_agent.write().await;
+        *u = ua.to_string();
+        let new_client = Self::build_client(&u);
+        let mut c = self.client.write().await;
+        *c = new_client;
+        log::info!("Reqwest client updated with dynamic User-Agent: {}", *u);
     }
 
     /// Store raw Cookie string to be sent with every request

@@ -1,32 +1,75 @@
 plugins {
     id "com.android.application"
-    id "kotlin-android"
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
-    id "dev.flutter.flutter-gradle-plugin"
+    id "org.jetbrains.kotlin.android"
+    id "org.jetbrains.kotlin.plugin.compose"
+    id "org.jetbrains.kotlin.plugin.serialization"
 }
 
-def localProperties = new Properties()
-def localPropertiesFile = rootProject.file("local.properties")
-if (localPropertiesFile.exists()) {
-    localPropertiesFile.withReader("UTF-8") { reader ->
-        localProperties.load(reader)
+// ─── Rust Native 增量编译 Task ────────────────────────────────────────────────
+// Gradle 通过 inputs.dir / inputs.file 跟踪 Rust 源码变更。
+// 仅当 rust/src 或 Cargo.toml 发生改动时才重新执行 cargo ndk，
+// 否则直接报告 UP-TO-DATE 跳过，完全不影响纯 Kotlin 增量构建速度。
+def rustSrcDir    = file("../../rust/src")
+def cargoToml     = file("../../rust/Cargo.toml")
+def cargoLock     = file("../../rust/Cargo.lock")
+def cargoConfig   = file("../../rust/.cargo/config.toml")
+def jniLibsDir    = file("src/main/jniLibs")
+
+tasks.register("buildRustNdk", Exec) {
+    group       = "build"
+    description = "Compile Rust core for arm64-v8a via cargo-ndk (incremental)"
+
+    inputs.dir(rustSrcDir)
+    inputs.file(cargoToml)
+    inputs.file(cargoLock)
+    inputs.file(cargoConfig)
+    outputs.dir(jniLibsDir)
+
+    workingDir = file("../../rust")
+
+    // Use NDK version declared in android {} block
+    doFirst {
+        def ndkDir = android.ndkDirectory?.absolutePath ?: System.getenv("NDK_HOME") ?: ""
+        if (ndkDir) environment("NDK_HOME", ndkDir)
     }
+
+    commandLine(
+        "cargo", "ndk",
+        "-t", "arm64-v8a",
+        "-o", jniLibsDir.absolutePath,
+        "build", "--release"
+    )
+
+    // Surface Cargo errors clearly in Gradle output
+    standardOutput = System.out
+    errorOutput    = System.err
 }
 
-def flutterVersionCode = localProperties.getProperty("flutter.versionCode")
-if (flutterVersionCode == null) {
-    flutterVersionCode = "1"
+tasks.named("preBuild") {
+    dependsOn("buildRustNdk")
 }
-
-def flutterVersionName = localProperties.getProperty("flutter.versionName")
-if (flutterVersionName == null) {
-    flutterVersionName = "1.0"
-}
+// ─────────────────────────────────────────────────────────────────────────────
 
 android {
     namespace = "com.example.ehviewer_scaffold"
-    compileSdk = 36
+    compileSdk = 35
     ndkVersion = "27.0.12077973"
+
+    defaultConfig {
+        applicationId = "com.example.ehviewer_scaffold"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0.0"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    buildFeatures {
+        compose = true
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -34,34 +77,57 @@ android {
     }
 
     kotlinOptions {
-        jvmTarget = '17'
-    }
-
-    defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.ehviewer_scaffold"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://docs.flutter.dev/deployment/android#reviewing-the-gradle-build-configuration.
-        minSdk = 23 // flutter_secure_storage v10 requires API 23+
-        targetSdk = 36
-        versionCode = flutterVersionCode.toInteger()
-        versionName = flutterVersionName
-
-        // 纯 64 位安卓：只打包 arm64-v8a（32 位 / x86 模拟器库不进入 APK）。
-        ndk {
-            abiFilters "arm64-v8a"
-        }
+        jvmTarget = "17"
     }
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
+            minifyEnabled = false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             signingConfig = signingConfigs.debug
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
         }
     }
 }
 
-flutter {
-    source = "../.."
+dependencies {
+    def composeBom = platform("androidx.compose:compose-bom:2024.12.01")
+    implementation composeBom
+    androidTestImplementation composeBom
+
+    implementation "androidx.compose.ui:ui"
+    implementation "androidx.compose.ui:ui-graphics"
+    implementation "androidx.compose.ui:ui-tooling-preview"
+    implementation "androidx.compose.material3:material3"
+    implementation "androidx.compose.material:material-icons-extended"
+    debugImplementation "androidx.compose.ui:ui-tooling"
+
+    implementation "androidx.activity:activity-compose:1.10.1"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7"
+    implementation "androidx.lifecycle:lifecycle-runtime-compose:2.8.7"
+    implementation "androidx.navigation:navigation-compose:2.8.8"
+
+    // Image loading: Coil 3 for Compose
+    // coil-network-okhttp is kept for thumbnail/cover loading (non-EH-viewer URLs)
+    implementation "io.coil-kt.coil3:coil-compose:3.1.0"
+    implementation "io.coil-kt.coil3:coil-network-okhttp:3.1.0"
+
+    // Serialization & Coroutines
+    implementation "org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1"
+
+    // DataStore
+    implementation "androidx.datastore:datastore-preferences:1.1.3"
+
+    // WebKit & Browser for Cookie Login
+    implementation "androidx.webkit:webkit:1.12.1"
+    implementation "androidx.browser:browser:1.8.0"
+
+    // Core KTX
+    implementation "androidx.core:core-ktx:1.15.0"
 }
