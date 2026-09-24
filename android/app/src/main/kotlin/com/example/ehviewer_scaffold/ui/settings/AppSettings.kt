@@ -3,6 +3,8 @@ package com.example.ehviewer_scaffold.ui.settings
 import android.content.Context
 import android.content.SharedPreferences
 import com.example.ehviewer_scaffold.rust.EhRustBridge
+import com.example.ehviewer_scaffold.rust.GalleryItem
+import kotlinx.coroutines.launch
 
 /**
  * 全局应用设置管理器（基于 SharedPreferences，与 Rust 底层配置实时同步）
@@ -54,6 +56,8 @@ object AppSettings {
     const val KEY_SECURITY_BIOMETRIC = "security_biometric" // 指纹/面容解锁
     const val KEY_SECURITY_BLUR_RECENT = "security_blur_recent" // 在最近任务中模糊界面
 
+    private val ioScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob())
+
     private fun getPrefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
     }
@@ -66,7 +70,9 @@ object AppSettings {
     fun setExHentai(context: Context, isEx: Boolean) {
         getPrefs(context).edit().putBoolean(KEY_IS_EX_HENTAI, isEx).apply()
         val siteUrl = if (isEx) "https://exhentai.org" else "https://e-hentai.org"
-        EhRustBridge.setSiteUrl(siteUrl)
+        ioScope.launch {
+            EhRustBridge.setSiteUrl(siteUrl)
+        }
     }
 
     // ─── 显示设置 ─────────────────────────────────────────────────────────────
@@ -185,7 +191,7 @@ object AppSettings {
     }
 
     fun getThemeColor(context: Context): String {
-        return getPrefs(context).getString(KEY_THEME_COLOR, "纯净白") ?: "纯净白"
+        return getPrefs(context).getString(KEY_THEME_COLOR, "经典绿") ?: "经典绿"
     }
 
     fun setThemeColor(context: Context, color: String) {
@@ -207,19 +213,21 @@ object AppSettings {
 
     fun setDownloadConcurrency(context: Context, n: Int) {
         getPrefs(context).edit().putInt(KEY_DOWNLOAD_CONCURRENCY, n).apply()
-        EhRustBridge.setDownloadConcurrency(n)
+        ioScope.launch {
+            EhRustBridge.setDownloadConcurrency(n)
+        }
     }
 
     fun getDownloadDir(context: Context): String {
         val saved = getPrefs(context).getString(KEY_DOWNLOAD_DIR, "") ?: ""
-        if (saved.isNotEmpty()) return saved
-        val rustDir = EhRustBridge.getDownloadDir()
-        return if (rustDir.isNotEmpty()) rustDir else "${context.cacheDir.absolutePath}/eh_downloads"
+        return if (saved.isNotEmpty()) saved else "${context.cacheDir.absolutePath}/eh_downloads"
     }
 
     fun setDownloadDir(context: Context, path: String) {
         getPrefs(context).edit().putString(KEY_DOWNLOAD_DIR, path).apply()
-        EhRustBridge.setDownloadDir(path)
+        ioScope.launch {
+            EhRustBridge.setDownloadDir(path)
+        }
     }
 
     // ─── 搜索设置 ─────────────────────────────────────────────────────────────
@@ -261,6 +269,63 @@ object AppSettings {
 
     fun setBlockedTags(context: Context, tags: Set<String>) {
         getPrefs(context).edit().putStringSet(KEY_BLOCKED_TAGS, tags).apply()
+        // Mirror to Rust on every change. Blocking a tag has to take effect on
+        // the *next* listing fetch, and Rust is what filters listings (and what
+        // appends the tags as `-ns:tag` exclusions when a query exists).
+        pushBlockedTagsToRust(tags)
+    }
+
+    /**
+     * Hand the block list to the Rust side. SharedPreferences stays
+     * authoritative — this in-memory copy is replayed at cold start, exactly
+     * like the site URL and the download directory.
+     */
+    private fun pushBlockedTagsToRust(tags: Set<String>) {
+        val payload = try {
+            EhRustBridge.json.encodeToString(tags.toList())
+        } catch (_: Throwable) {
+            return
+        }
+        ioScope.launch {
+            try {
+                EhRustBridge.setBlockedTags(payload)
+                lastPushedBlockedTags = tags
+            } catch (_: Throwable) {
+                // Rust may not be loaded yet during very early startup; the cold
+                // start replay in EhApplication covers that case.
+            }
+        }
+    }
+
+    /** Last list successfully handed to Rust, so a no-op push costs nothing. */
+    @Volatile
+    private var lastPushedBlockedTags: Set<String> = emptySet()
+
+    /**
+     * Push the block list to Rust **synchronously**, if it is not already there.
+     *
+     * For callers that need the Rust side to know the list before their next call.
+     * The listing request uses it to decide whether an exclusion-only probe is
+     * worthwhile, and on a cold start the Application's background push loses that
+     * race — measured on device: the first listing was checked 192 ms before the
+     * block list arrived, so the probe was skipped entirely.
+     *
+     * Must be called **off the main thread**: it crosses JNI.
+     */
+    fun pushBlockedTagsBlocking(context: Context) {
+        val current = getBlockedTags(context)
+        if (current == lastPushedBlockedTags) return
+        val payload = try {
+            EhRustBridge.json.encodeToString(current.toList())
+        } catch (_: Throwable) {
+            return
+        }
+        try {
+            if (EhRustBridge.setBlockedTags(payload)) {
+                lastPushedBlockedTags = current
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     fun addBlockedTag(context: Context, tag: String) {
@@ -332,6 +397,66 @@ object AppSettings {
         getPrefs(context).edit().putBoolean(KEY_SECURITY_BLUR_RECENT, enabled).apply()
     }
 
+    // ─── 浏览历史 ─────────────────────────────────────────────────────────────
+    private const val KEY_HISTORY = "browse_history"
+    /** Oldest entries drop off; 300 covers a long while without bloating the prefs. */
+    private const val HISTORY_LIMIT = 300
+
+    /**
+     * Galleries opened on this device, most recent first.
+     *
+     * Recorded locally rather than read from E-Hentai's `/history`, which is gated
+     * behind account perks and therefore empty for most users.
+     */
+    fun getHistory(context: Context): List<GalleryItem> {
+        val raw = getPrefs(context).getString(KEY_HISTORY, "") ?: ""
+        if (raw.isBlank()) return emptyList()
+        return try {
+            EhRustBridge.json.decodeFromString(raw)
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    /** Record a gallery as opened, moving it to the front if already present. */
+    fun addHistory(context: Context, item: GalleryItem) {
+        if (item.gid.isBlank() || item.token.isBlank()) return
+        val current = getHistory(context).toMutableList()
+        current.removeAll { it.gid == item.gid }
+        current.add(0, item)
+        val raw = try {
+            EhRustBridge.json.encodeToString(current.take(HISTORY_LIMIT))
+        } catch (_: Throwable) {
+            return
+        }
+        getPrefs(context).edit().putString(KEY_HISTORY, raw).apply()
+    }
+
+    fun clearHistory(context: Context) {
+        getPrefs(context).edit().remove(KEY_HISTORY).apply()
+    }
+
+    // ─── 会话 Cookie ──────────────────────────────────────────────────────────
+    private const val KEY_SESSION_COOKIE = "session_cookie"
+
+    /**
+     * Mirror of the EH session cookie, so it can be replayed into Rust at cold start.
+     *
+     * Rust holds the session in memory only, so without a replay every restart loses it
+     * and the signed-in pages (watched / favorites / history) answer "not logged in"
+     * even though the login screen insists otherwise.
+     *
+     * The authoritative copy is still WebView's CookieManager — that is what the
+     * image requests use. This mirror exists because touching `CookieManager` inside
+     * `Application.onCreate` would force WebView to load on a background thread.
+     */
+    fun getSessionCookie(context: Context): String =
+        getPrefs(context).getString(KEY_SESSION_COOKIE, "") ?: ""
+
+    fun setSessionCookie(context: Context, cookie: String) {
+        getPrefs(context).edit().putString(KEY_SESSION_COOKIE, cookie).apply()
+    }
+
     // ─── 搜索历史 ─────────────────────────────────────────────────────────────
     private const val KEY_SEARCH_HISTORY = "search_history"
     private const val MAX_HISTORY = 20
@@ -354,6 +479,34 @@ object AppSettings {
 
     fun clearSearchHistory(context: Context) {
         getPrefs(context).edit().remove(KEY_SEARCH_HISTORY).apply()
+    }
+
+    // ─── 阅读进度 ─────────────────────────────────────────────────────────────
+    // One int per gallery instead of a single serialised blob: reads and writes
+    // are O(1) and never touch another gallery's entry. The trade-off is one
+    // XML entry per gallery ever opened, which is fine at realistic sizes —
+    // if it ever matters, sweep entries older than the oldest download instead
+    // of rewriting the whole map on every page turn.
+    private const val KEY_READ_PROGRESS_PREFIX = "read_progress_"
+
+    /**
+     * Last page the reader was left on, **0-based**; `-1` when this gallery has
+     * never been opened. 0 is a legitimate value (page 1) and must not be read
+     * as "no progress".
+     */
+    fun getReadingProgress(context: Context, gid: String): Int {
+        if (gid.isEmpty()) return -1
+        return getPrefs(context).getInt(KEY_READ_PROGRESS_PREFIX + gid, -1)
+    }
+
+    fun saveReadingProgress(context: Context, gid: String, page: Int) {
+        if (gid.isEmpty() || page < 0) return
+        getPrefs(context).edit().putInt(KEY_READ_PROGRESS_PREFIX + gid, page).apply()
+    }
+
+    fun clearReadingProgress(context: Context, gid: String) {
+        if (gid.isEmpty()) return
+        getPrefs(context).edit().remove(KEY_READ_PROGRESS_PREFIX + gid).apply()
     }
 }
 

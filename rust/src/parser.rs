@@ -21,6 +21,10 @@ lazy_static! {
     static ref S_CAT: Selector = Selector::parse(".cn, .cs").unwrap();
     static ref S_UPLOADER: Selector = Selector::parse("a[href*='/uploader/']").unwrap();
     static ref S_DATE: Selector = Selector::parse("div[id^='posted_']").unwrap();
+    /// Outer wrapper of a list thumbnail. Carries the `style` attribute holding the
+    /// real cover dimensions on both the legacy table layout (`div.glthumb`) and the
+    /// modern card layout (`div.gl1t > div.glthumb`).
+    static ref S_THUMB_WRAP: Selector = Selector::parse("div.glthumb").unwrap();
 
     static ref S_GN: Selector = Selector::parse("h1#gn").unwrap();
     static ref S_GJ: Selector = Selector::parse("h1#gj").unwrap();
@@ -30,10 +34,11 @@ lazy_static! {
     static ref S_TAG_ROW: Selector = Selector::parse("div#taglist table tr").unwrap();
     static ref S_TAG_GROUP: Selector = Selector::parse("td.tc").unwrap();
     static ref S_DIV_A: Selector = Selector::parse("div a").unwrap();
-    static ref S_GDT_ITEM: Selector = Selector::parse("div#gdt > div, div.gdtm, div.gdtl").unwrap();
+    static ref S_GDT_ITEM: Selector = Selector::parse("div#gdt > div, div#gdt > a, div.gdtm, div.gdtl").unwrap();
     static ref S_LINK_S: Selector = Selector::parse("a[href*='/s/']").unwrap();
     static ref S_IMG: Selector = Selector::parse("img").unwrap();
     static ref S_DIV_STYLE: Selector = Selector::parse("div[style]").unwrap();
+    static ref S_STYLE_ELEM: Selector = Selector::parse("div[style], a[style], span[style]").unwrap();
     static ref S_DIRECT_LINK: Selector = Selector::parse("div#gdt a[href*='/s/']").unwrap();
     static ref S_GD1_IMG: Selector = Selector::parse("div#gd1 img").unwrap();
     static ref S_GDD_ROW: Selector = Selector::parse("div#gdd tr").unwrap();
@@ -62,6 +67,16 @@ pub struct GalleryItem {
     pub category: String,
     pub uploader: String,
     pub post_date: String,
+    /// Real cover dimensions, read from the listing thumbnail wrapper's inline
+    /// `style` (e.g. `width:250px; height:346px`). 0 when unknown.
+    ///
+    /// The UI uses these to size each waterfall cell to the cover's true aspect
+    /// ratio. Hardcoding a portrait ratio instead forces `ContentScale.Crop` to
+    /// chop the sides off wide covers.
+    #[serde(default)]
+    pub thumb_width: u32,
+    #[serde(default)]
+    pub thumb_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +92,24 @@ pub struct GalleryThumbnail {
     pub height: u32,
     pub offset_x: u32,
     pub offset_y: u32,
+}
+
+/// Extract the first `Npx` value that follows `key` in an inline CSS declaration.
+///
+/// Handles the whitespace EH actually emits (`width: 250px`, `width:250px`,
+/// `-200px -140px` for sprite offsets) and stops at the value's unit so trailing
+/// declarations cannot bleed into the number.
+fn parse_px_value(style: &str, key: &str) -> u32 {
+    let Some(start) = style.find(key) else {
+        return 0;
+    };
+    let rest = &style[start + key.len()..];
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +142,30 @@ pub struct EhWebConfig {
 /// Parse gallery comments from a detail-page HTML document
 /// (structure: #cdiv > div.c1 [id="c_<n>"] > div.c3 [meta] + div.c6 [content],
 /// plus optional vote links / score spans).
+/// Run a parser over untrusted third-party markup, converting a panic into the
+/// supplied fallback instead of letting it propagate.
+///
+/// Every public parser entry point is wrapped in this. Parsing is the one place
+/// in this crate that indexes and slices text we do not control — a malformed
+/// page can trigger a non-char-boundary slice (very reachable with CJK text) or
+/// an out-of-range index. The crate is deliberately built **without**
+/// `panic = "abort"` so that unwinding is available here: a bad page must
+/// degrade into an error / empty result, never take the whole app down.
+fn guarded<T>(what: &str, fallback: impl FnOnce() -> T, parse: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(parse)) {
+        Ok(value) => value,
+        Err(_) => {
+            log::error!("parser panicked in {} — treating input as malformed", what);
+            fallback()
+        }
+    }
+}
+
 pub fn parse_comments(html: &str) -> Vec<GalleryComment> {
+    guarded("parse_comments", Vec::new, || parse_comments_inner(html))
+}
+
+fn parse_comments_inner(html: &str) -> Vec<GalleryComment> {
     let document = Html::parse_document(html);
     let mut comments = Vec::new();
 
@@ -191,6 +247,10 @@ pub fn parse_comments(html: &str) -> Vec<GalleryComment> {
 /// Parse the CSRF `vote_key` hidden input used by the web rating form.
 /// Returns `None` when the form is missing (not logged in or unsupported page).
 pub fn parse_vote_key(html: &str) -> Option<String> {
+    guarded("parse_vote_key", || None, || parse_vote_key_inner(html))
+}
+
+fn parse_vote_key_inner(html: &str) -> Option<String> {
     let document = Html::parse_document(html);
     document.select(&S_VOTE_KEY).next()?.value().attr("value").map(|v| v.to_string())
 }
@@ -219,6 +279,10 @@ pub struct GalleryDetail {
 /// Extract GID and token from E-Hentai gallery URL
 /// URL format: https://e-hentai.org/g/{gid}/{token}/
 pub fn parse_gid_token(url: &str) -> Option<(String, String)> {
+    guarded("parse_gid_token", || None, || parse_gid_token_inner(url))
+}
+
+fn parse_gid_token_inner(url: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = url.split('/').collect();
     if let Some(g_idx) = parts.iter().position(|&p| p == "g") {
         if g_idx + 2 < parts.len() {
@@ -239,6 +303,14 @@ pub struct GalleryPage {
 }
 
 pub fn parse_gallery_list(html: &str) -> Result<GalleryPage> {
+    guarded(
+        "parse_gallery_list",
+        || Err(anyhow::anyhow!("gallery list HTML could not be parsed")),
+        || parse_gallery_list_inner(html),
+    )
+}
+
+fn parse_gallery_list_inner(html: &str) -> Result<GalleryPage> {
     let document = Html::parse_document(html);
     let mut items = Vec::new();
     let mut next_url = None;
@@ -276,6 +348,71 @@ pub fn parse_gallery_list(html: &str) -> Result<GalleryPage> {
             })
             .unwrap_or("")
             .to_string();
+
+        // 3b. Real cover dimensions.
+        //
+        // Read these off the *inner* `<img>` first and only fall back to the
+        // wrapper. Three distinct layouts have to keep working:
+        //
+        //   - Classic ("Thumbnail"): `div.glthumb` wraps a bare `<img>`. The
+        //     wrapper carries EH's fixed 250x346 listing box in its inline
+        //     style, so trusting it would report 0.72 for every row no matter
+        //     what the cover actually looks like.
+        //   - Modern ("Extended"): the cell is `a > div.glthumb > img` too, but
+        //     the img sometimes ships explicit `width`/`height` attributes which
+        //     *are* the real thumbnail shape.
+        //   - Sprite ("Minimal"/"Compact"): `div.gdtm`/`div.gdtl` render CSS
+        //     background sprites, so there is no `<img>` size to read at all and
+        //     the wrapper is the only signal available.
+        //
+        // Measured on a live listing (2026-09): every row came back 0/0. The
+        // served thumbnails were `https://ehgt.org/w/../*.webp`, the `<img>` had
+        // no width/height, and there was no inline-styled `div.glthumb` either —
+        // the listing sizes its cells from a stylesheet, so the markup simply
+        // does not carry the numbers. Nothing here is broken; the data is absent.
+        //
+        // The UI must therefore not depend on this field: `GalleryGridCard` and
+        // `GalleryCompactCard` treat it as a pre-load placeholder and replace it
+        // with the decoded bitmap's own ratio. Keep parsing it anyway — other
+        // layouts do expose real sizes, and a correct guess avoids a relayout.
+        //
+        // `S_IMG_LIST` deliberately matches several ancestors
+        // (`a[href*='/g/'] img, div.glthumb img, .gl1t img`) because the layout
+        // varies per user setting. Selecting `.next()` can therefore land on a
+        // decorative image (rating star, category icon) rather than the cover,
+        // so scan every candidate and take the first one that actually carries
+        // usable dimensions.
+        let img_size = item
+            .select(&S_IMG_LIST)
+            .filter_map(|img| {
+                let attr = |name: &str| -> u32 {
+                    img.value()
+                        .attr(name)
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                        .unwrap_or(0)
+                };
+                let (w, h) = (attr("width"), attr("height"));
+                if w > 0 && h > 0 {
+                    Some((w, h))
+                } else {
+                    None
+                }
+            })
+            .next();
+
+        let (mut thumb_width, mut thumb_height) = img_size.unwrap_or((0, 0));
+
+        if thumb_width == 0 || thumb_height == 0 {
+            // Some layouts put the size only in the wrapper's inline style. Use it
+            // as a last resort, accepting that it may be the fixed box.
+            let thumb_style = item
+                .select(&S_THUMB_WRAP)
+                .next()
+                .and_then(|el| el.value().attr("style"))
+                .unwrap_or("");
+            thumb_width = parse_px_value(thumb_style, "width:");
+            thumb_height = parse_px_value(thumb_style, "height:");
+        }
 
         // 4. Category
         let category = item.select(&S_CAT)
@@ -318,6 +455,8 @@ pub fn parse_gallery_list(html: &str) -> Result<GalleryPage> {
                         category,
                         uploader,
                         post_date,
+                        thumb_width,
+                        thumb_height,
                     });
                 }
             }
@@ -331,14 +470,24 @@ pub fn parse_gallery_list(html: &str) -> Result<GalleryPage> {
 }
 
 pub fn parse_gallery_detail(html: &str) -> Result<GalleryDetail> {
+    guarded(
+        "parse_gallery_detail",
+        || Err(anyhow::anyhow!("gallery detail HTML could not be parsed")),
+        || parse_gallery_detail_inner(html),
+    )
+}
+
+fn parse_gallery_detail_inner(html: &str) -> Result<GalleryDetail> {
     let document = Html::parse_document(html);
 
     let mut image_urls = Vec::new();
     let mut thumbnails = Vec::new();
 
     for item in document.select(&S_GDT_ITEM) {
-        // Must contain a viewer link /s/
-        let href = match item.select(&S_LINK_S).next().and_then(|a| a.value().attr("href")) {
+        // Must contain a viewer link /s/ (either item is <a href="..."> or contains one)
+        let href = match item.value().attr("href")
+            .filter(|h| h.contains("/s/"))
+            .or_else(|| item.select(&S_LINK_S).next().and_then(|a| a.value().attr("href"))) {
             Some(h) if h.contains("/s/") => h.to_string(),
             _ => continue,
         };
@@ -350,12 +499,12 @@ pub fn parse_gallery_detail(html: &str) -> Result<GalleryDetail> {
         let mut offset_y = 0;
         let mut url = String::new();
 
-        // 1. Check for CSS sprite sheet (Mode A: gdtm)
-        // Style can be on item itself or any child div (e.g. <div class="gdtm"><div style="...">)
+        // 1. Check for CSS sprite sheet (Mode A: gdtm or modern div#gdt > a > div[style])
+        // Style can be on item itself or any child
         let mut style_opt = item.value().attr("style").filter(|s| s.contains("url(") || s.contains("URL("));
         if style_opt.is_none() {
-            for div in item.select(&S_DIV_STYLE) {
-                if let Some(s) = div.value().attr("style") {
+            for sub in item.select(&S_STYLE_ELEM) {
+                if let Some(s) = sub.value().attr("style") {
                     if s.contains("url(") || s.contains("URL(") {
                         style_opt = Some(s);
                         break;
@@ -365,18 +514,8 @@ pub fn parse_gallery_detail(html: &str) -> Result<GalleryDetail> {
         }
 
         if let Some(style) = style_opt {
-            if let Some(w_start) = style.find("width:") {
-                let w_end = style[w_start..].find("px").unwrap_or(0) + w_start;
-                if let Ok(w) = style[w_start + 6..w_end].trim().parse::<u32>() {
-                    width = w;
-                }
-            }
-            if let Some(h_start) = style.find("height:") {
-                let h_end = style[h_start..].find("px").unwrap_or(0) + h_start;
-                if let Ok(h) = style[h_start + 7..h_end].trim().parse::<u32>() {
-                    height = h;
-                }
-            }
+            width = parse_px_value(style, "width:");
+            height = parse_px_value(style, "height:");
             if let Some(u_start) = style.find("url(") {
                 if let Some(u_end) = style[u_start..].find(')') {
                     url = style[u_start + 4..u_start + u_end]
@@ -384,11 +523,11 @@ pub fn parse_gallery_detail(html: &str) -> Result<GalleryDetail> {
                         .trim()
                         .to_string();
 
-                    // Parse offsets after url(...), e.g. -200px -140px
+                    // Parse offsets after url(...), e.g. -200px -140px or -0px 0
                     let after_url = &style[u_start + u_end + 1..];
                     let mut numeric_offsets = Vec::new();
                     for token in after_url.split_whitespace() {
-                        let clean_token = token.trim_end_matches("px");
+                        let clean_token = token.trim_end_matches("px").trim_end_matches(';');
                         if let Ok(val) = clean_token.parse::<i32>() {
                             numeric_offsets.push(val.abs() as u32);
                         }
@@ -424,22 +563,73 @@ pub fn parse_gallery_detail(html: &str) -> Result<GalleryDetail> {
         });
     }
 
-    // Fallback: If div#gdt > div didn't find items, fallback to a[href*='/s/'] directly
+    // Fallback: If div#gdt > div/a didn't find items, fallback to a[href*='/s/'] directly
     if image_urls.is_empty() {
         for el in document.select(&S_DIRECT_LINK) {
             if let Some(href) = el.value().attr("href") {
                 image_urls.push(href.to_string());
-                let img_src = el.select(&S_IMG).next()
-                    .and_then(|img| img.value().attr("src"))
-                    .filter(|s| !s.contains("blank.gif"))
-                    .unwrap_or("")
-                    .to_string();
+                
+                let mut width = 0;
+                let mut height = 0;
+                let mut offset_x = 0;
+                let mut offset_y = 0;
+                let mut url = String::new();
+
+                let mut style_opt = el.value().attr("style").filter(|s| s.contains("url(") || s.contains("URL("));
+                if style_opt.is_none() {
+                    for sub in el.select(&S_STYLE_ELEM) {
+                        if let Some(s) = sub.value().attr("style") {
+                            if s.contains("url(") || s.contains("URL(") {
+                                style_opt = Some(s);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(style) = style_opt {
+                    width = parse_px_value(style, "width:");
+                    height = parse_px_value(style, "height:");
+                    if let Some(u_start) = style.find("url(") {
+                        if let Some(u_end) = style[u_start..].find(')') {
+                            url = style[u_start + 4..u_start + u_end]
+                                .trim_matches(|c| c == '\'' || c == '\"')
+                                .trim()
+                                .to_string();
+
+                            let after_url = &style[u_start + u_end + 1..];
+                            let mut numeric_offsets = Vec::new();
+                            for token in after_url.split_whitespace() {
+                                let clean_token = token.trim_end_matches("px").trim_end_matches(';');
+                                if let Ok(val) = clean_token.parse::<i32>() {
+                                    numeric_offsets.push(val.abs() as u32);
+                                }
+                            }
+                            if !numeric_offsets.is_empty() {
+                                offset_x = numeric_offsets[0];
+                            }
+                            if numeric_offsets.len() >= 2 {
+                                offset_y = numeric_offsets[1];
+                            }
+                        }
+                    }
+                }
+
+                if url.is_empty() {
+                    let img_src = el.select(&S_IMG).next()
+                        .and_then(|img| img.value().attr("data-src").or_else(|| img.value().attr("src")))
+                        .filter(|s| !s.contains("blank.gif"))
+                        .unwrap_or("")
+                        .to_string();
+                    url = img_src;
+                }
+
                 thumbnails.push(GalleryThumbnail {
-                    url: img_src,
-                    width: 0,
-                    height: 0,
-                    offset_x: 0,
-                    offset_y: 0,
+                    url,
+                    width,
+                    height,
+                    offset_x,
+                    offset_y,
                 });
             }
         }
@@ -555,6 +745,14 @@ pub fn parse_gallery_detail(html: &str) -> Result<GalleryDetail> {
 
 /// Parse the actual image URL from an E-Hentai viewer page (e.g. /s/...)
 pub fn parse_image_url(html: &str) -> Result<String> {
+    guarded(
+        "parse_image_url",
+        || Err(anyhow::anyhow!("viewer page image URL not found")),
+        || parse_image_url_inner(html),
+    )
+}
+
+fn parse_image_url_inner(html: &str) -> Result<String> {
     let document = Html::parse_document(html);
     
     if let Some(img_el) = document.select(&S_IMG_IMG).next() {
@@ -565,6 +763,35 @@ pub fn parse_image_url(html: &str) -> Result<String> {
     
     Err(anyhow::anyhow!("Failed to find image src in viewer page"))
 }
+
+/// Extract the EH `nl` reload token from the viewer page HTML.
+/// EH emits a load-fail link: `<a id="loadfail" href="#" onclick="return nl('49234-58291')">`
+pub fn parse_nl_token(html: &str) -> Option<String> {
+    guarded("parse_nl_token", || None, || parse_nl_token_inner(html))
+}
+
+fn parse_nl_token_inner(html: &str) -> Option<String> {
+    for needle in ["nl('", "nl(\"", "nl(&#39;"] {
+        if let Some(pos) = html.find(needle) {
+            let start = pos + needle.len();
+            let end_char = if needle.ends_with('\'') {
+                '\''
+            } else if needle.ends_with('\"') {
+                '\"'
+            } else {
+                '&'
+            };
+            if let Some(end) = html[start..].find(end_char) {
+                let token = html[start..start + end].trim();
+                if !token.is_empty() && token.len() < 128 && !token.contains('\n') {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 
 /// A single torrent entry from the gallery torrents popup (/gallerytorrents.php).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -620,6 +847,10 @@ fn find_torrent_token(s: &str) -> Option<String> {
 
 /// Parse the torrent list from /gallerytorrents.php (one <form> per torrent).
 pub fn parse_torrents(html: &str) -> Vec<TorrentItem> {
+    guarded("parse_torrents", Vec::new, || parse_torrents_inner(html))
+}
+
+fn parse_torrents_inner(html: &str) -> Vec<TorrentItem> {
     let document = Html::parse_document(html);
     let mut items = Vec::new();
     let mut global_token = String::new();
@@ -701,6 +932,14 @@ pub fn parse_torrents(html: &str) -> Vec<TorrentItem> {
 
 /// Parse user configuration settings from uconfig.php HTML
 pub fn parse_eh_web_config(html: &str) -> Result<EhWebConfig> {
+    guarded(
+        "parse_eh_web_config",
+        || Err(anyhow::anyhow!("uc-config page could not be parsed")),
+        || parse_eh_web_config_inner(html),
+    )
+}
+
+fn parse_eh_web_config_inner(html: &str) -> Result<EhWebConfig> {
     let document = Html::parse_document(html);
     let mut raw_params = std::collections::HashMap::new();
 
@@ -775,11 +1014,18 @@ pub fn parse_eh_web_config(html: &str) -> Result<EhWebConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_gallery_detail, parse_gallery_list, parse_eh_web_config};
+    use super::{parse_gallery_detail, parse_gallery_list, parse_eh_web_config, parse_nl_token, parse_px_value};
 
     /// Regression fixture: real front-page HTML captured from e-hentai.org.
     /// Guards against silent parser breakage when the site tweaks its markup.
+    ///
+    /// The captured HTML is intentionally NOT committed (`.gitignore` excludes
+    /// `/test_*.html`), so this test cannot run on a clean checkout. Ignored
+    /// rather than failing, so `cargo test` stays green and nobody mistakes a
+    /// missing fixture for a broken parser. To run it, drop a captured listing
+    /// at `<repo>/test_list.html` and use `cargo test -- --ignored`.
     #[test]
+    #[ignore = "requires a captured test_list.html fixture that is not in git"]
     fn parses_captured_front_page() {
         let html = std::fs::read_to_string("../test_list.html").expect("fixture missing");
         let page = parse_gallery_list(&html).expect("list should parse");
@@ -791,7 +1037,10 @@ mod tests {
         }
     }
 
+    /// Companion to [parses_captured_front_page] — see that test for why this is
+    /// ignored and how to supply the fixture.
     #[test]
+    #[ignore = "requires a captured test_detail.html fixture that is not in git"]
     fn parses_captured_detail_page() {
         let html = std::fs::read_to_string("../test_detail.html").expect("fixture missing");
         let detail = parse_gallery_detail(&html).expect("detail should parse");
@@ -863,4 +1112,143 @@ mod tests {
         assert_eq!(detail.thumbnails[1].offset_x, 0);
         assert_eq!(detail.thumbnails[1].offset_y, 0);
     }
+
+    #[test]
+    fn parses_modern_gdt_a_thumbnails() {
+        let sample_html = r#"
+            <h1 id="gn">Modern Gallery</h1>
+            <div id="gdt" class="gt200">
+                <a href="https://e-hentai.org/s/4bc0975241/4197317-1">
+                    <div title="Page 1: 01.jpg" style="width:200px;height:200px;background:transparent url(https://sunvxqrqcj.hath.network/c2/53dsy4qufnlt6c18yh/4197317-0.webp) -0px 0 no-repeat"></div>
+                </a>
+                <a href="https://e-hentai.org/s/7c64b07b9c/4197317-2">
+                    <div title="Page 2: 02.jpg" style="width:200px;height:200px;background:transparent url(https://sunvxqrqcj.hath.network/c2/53dsy4qufnlt6c18yh/4197317-0.webp) -200px 0 no-repeat"></div>
+                </a>
+            </div>
+        "#;
+        let detail = parse_gallery_detail(sample_html).expect("detail should parse");
+        assert_eq!(detail.image_urls.len(), 2);
+        assert_eq!(detail.thumbnails.len(), 2);
+        assert_eq!(detail.thumbnails[0].url, "https://sunvxqrqcj.hath.network/c2/53dsy4qufnlt6c18yh/4197317-0.webp");
+        assert_eq!(detail.thumbnails[0].width, 200);
+        assert_eq!(detail.thumbnails[0].height, 200);
+        assert_eq!(detail.thumbnails[0].offset_x, 0);
+        assert_eq!(detail.thumbnails[0].offset_y, 0);
+        assert_eq!(detail.thumbnails[1].offset_x, 200);
+        assert_eq!(detail.thumbnails[1].offset_y, 0);
+    }
+
+    #[test]
+    fn test_parse_nl_token() {
+        let sample = r##"<div><a id="loadfail" href="#" onclick="return nl('49234-58291')">Click here</a></div>"##;
+        assert_eq!(parse_nl_token(sample), Some("49234-58291".to_string()));
+
+        let sample2 = r##"<script>function reload() { return nl("98765-11223"); }</script>"##;
+        assert_eq!(parse_nl_token(sample2), Some("98765-11223".to_string()));
+
+        let sample_none = r#"<div>No fail link here</div>"#;
+        assert_eq!(parse_nl_token(sample_none), None);
+    }
+
+    /// The waterfall sizes each cell from `thumb_width`/`thumb_height`, so a wide
+    /// cover keeps its own aspect ratio instead of being cropped to a portrait box.
+    ///
+    /// Dimensions must come from the `<img>`, NOT from `div.glthumb`'s inline
+    /// style: the wrapper is EH's fixed 250x346 listing box, so reading it made
+    /// every cell portrait and letterboxed wide covers.
+    #[test]
+    fn list_item_carries_thumb_dimensions() {
+        let html = r##"
+            <table class="itg">
+              <tr>
+                <td><a href="https://e-hentai.org/g/123/abc/"><div class="glthumb"
+                     style="width:250px; height:346px"><img data-src="https://ehgt.org/t/01.jpg"
+                     width="250" height="346"></div></a></td>
+                <td><a class="glink" href="https://e-hentai.org/g/123/abc/">Portrait Gallery</a></td>
+              </tr>
+              <tr>
+                <td><a href="https://e-hentai.org/g/456/def/"><div class="glthumb"
+                     style="width:250px; height:346px"><img data-src="https://ehgt.org/t/02.jpg"
+                     width="250" height="141"></div></a></td>
+                <td><a class="glink" href="https://e-hentai.org/g/456/def/">Wide Gallery</a></td>
+              </tr>
+            </table>
+        "##;
+        let page = parse_gallery_list(html).expect("list should parse");
+        assert_eq!(page.items.len(), 2, "expected two gallery rows");
+
+        // Portrait cover: 250x346 => aspect ratio well below 1
+        assert_eq!(page.items[0].thumb_width, 250);
+        assert_eq!(page.items[0].thumb_height, 346);
+
+        // Wide 16:9-ish cover. The wrapper says 250x346 for BOTH rows, so this
+        // assertion is what proves the img is the source of truth: the wide row
+        // must report 141, not the wrapper's 346.
+        assert_eq!(page.items[1].thumb_width, 250);
+        assert_eq!(page.items[1].thumb_height, 141);
+    }
+
+    /// `S_IMG_LIST` matches several overflow patterns at once, so the first
+    /// `<img>` under the row is not necessarily the cover. A decorative image
+    /// (rating star, category icon) that appears earlier and carries no
+    /// size attributes must not shadow the real cover further down.
+    ///
+    /// This is the shape that produced 179x249 dp "0.72" cells in the app: when
+    /// no candidate reported a size the UI fell back to the portrait default for
+    /// every row.
+    #[test]
+    fn img_scan_skips_sizeless_decorative_images() {
+        let html = r##"
+            <table class="itg">
+              <tr>
+                <td><a href="https://e-hentai.org/g/123/abc/">
+                      <img src="https://ehgt.org/star.png">
+                      <div class="glthumb" style="width:250px; height:346px">
+                        <img data-src="https://ehgt.org/t/01.jpg" width="300" height="170">
+                      </div>
+                    </a></td>
+                <td><a class="glink" href="https://e-hentai.org/g/123/abc/">Gallery</a></td>
+              </tr>
+            </table>
+        "##;
+        let page = parse_gallery_list(html).expect("list should parse");
+        assert_eq!(page.items.len(), 1);
+        // The sized cover wins even though the star came first in document order.
+        assert_eq!(page.items[0].thumb_width, 300);
+        assert_eq!(page.items[0].thumb_height, 170);
+    }
+
+    /// When the `<img>` has no width/height attributes, fall back to the
+    /// wrapper's inline style rather than reporting 0/0 (which would make the UI
+    /// use the default ratio for every cell).
+    #[test]
+    fn thumb_dimensions_fall_back_to_wrapper_style() {
+        let html = r##"
+            <table class="itg">
+              <tr>
+                <td><a href="https://e-hentai.org/g/123/abc/"><div class="glthumb"
+                     style="width:250px; height:346px"><img data-src="https://ehgt.org/t/01.jpg"></div></a></td>
+                <td><a class="glink" href="https://e-hentai.org/g/123/abc/">Gallery</a></td>
+              </tr>
+            </table>
+        "##;
+        let page = parse_gallery_list(html).expect("list should parse");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].thumb_width, 250);
+        assert_eq!(page.items[0].thumb_height, 346);
+    }
+
+    /// `width: 250px` (with the space EH sometimes emits) must parse too, and a
+    /// wrapper without an inline style must degrade to 0/0 rather than a bogus size.
+    #[test]
+    fn px_value_parsing_tolerates_spacing_and_absence() {
+        assert_eq!(parse_px_value("width: 250px; height: 346px", "width:"), 250);
+        assert_eq!(parse_px_value("width:250px;height:346px", "width:"), 250);
+        assert_eq!(parse_px_value("width: 0px", "width:"), 0);
+        assert_eq!(parse_px_value("height: 346px", "width:"), 0);
+        assert_eq!(parse_px_value("", "width:"), 0);
+        // A percentage value must not be mistaken for pixels.
+        assert_eq!(parse_px_value("width:100%; height:200px", "width:"), 100);
+    }
 }
+

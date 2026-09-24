@@ -27,6 +27,12 @@ import kotlinx.coroutines.launch
 @Composable
 fun DownloadsScreen(
     onBack: (() -> Unit)? = null,
+    /**
+     * Open a finished download for offline reading. `null` hides the entry
+     * point entirely (e.g. when the screen is hosted somewhere without a nav
+     * controller).
+     */
+    onOpenGallery: ((gid: String, token: String) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -36,9 +42,15 @@ fun DownloadsScreen(
 
     fun refreshTasks() {
         scope.launch {
-            isLoading = true
             try {
-                tasks = EhRustBridge.getDownloads()
+                val updated = EhRustBridge.getDownloads()
+                tasks = updated
+                val hasActive = updated.any { it.status == 1 }
+                if (hasActive) {
+                    com.example.ehviewer_scaffold.service.DownloadService.start(context)
+                } else {
+                    com.example.ehviewer_scaffold.service.DownloadService.stop(context)
+                }
             } catch (_: Exception) {
             } finally {
                 isLoading = false
@@ -46,14 +58,24 @@ fun DownloadsScreen(
         }
     }
 
+    // 进入页面首次加载并开启 1 秒周期性进度轮询
     LaunchedEffect(Unit) {
-        refreshTasks()
-    }
-
-    LaunchedEffect(tasks) {
-        val hasActive = tasks.any { it.status == 1 }
-        if (hasActive) {
-            com.example.ehviewer_scaffold.service.DownloadService.start(context)
+        isLoading = true
+        while (true) {
+            try {
+                val updated = EhRustBridge.getDownloads()
+                tasks = updated
+                val hasActive = updated.any { it.status == 1 }
+                if (hasActive) {
+                    com.example.ehviewer_scaffold.service.DownloadService.start(context)
+                } else if (tasks.isNotEmpty()) {
+                    com.example.ehviewer_scaffold.service.DownloadService.stop(context)
+                }
+            } catch (_: Exception) {
+            } finally {
+                isLoading = false
+            }
+            kotlinx.coroutines.delay(1000L)
         }
     }
 
@@ -104,12 +126,34 @@ fun DownloadsScreen(
                                         refreshTasks()
                                     }
                                 },
+                                onResume = {
+                                    scope.launch {
+                                        val ok = try {
+                                            EhRustBridge.resumeDownloadTask(task.gid)
+                                        } catch (_: Exception) {
+                                            false
+                                        }
+                                        if (ok) {
+                                            com.example.ehviewer_scaffold.service.DownloadService.start(context)
+                                        } else {
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                "无法继续：缺少图片列表，请在画廊详情页重新点下载",
+                                                android.widget.Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                        refreshTasks()
+                                    }
+                                },
                                 onDelete = {
                                     scope.launch {
                                         EhRustBridge.deleteDownload(task.gid)
                                         refreshTasks()
                                     }
-                                }
+                                },
+                                onOpen = if (onOpenGallery != null && task.status == 2) {
+                                    { onOpenGallery(task.gid, task.token) }
+                                } else null
                             )
                         }
                     }
@@ -123,7 +167,9 @@ fun DownloadsScreen(
 fun DownloadTaskCard(
     task: DownloadTask,
     onPause: () -> Unit,
-    onDelete: () -> Unit
+    onResume: () -> Unit,
+    onDelete: () -> Unit,
+    onOpen: (() -> Unit)? = null
 ) {
     Card(
         shape = RoundedCornerShape(12.dp),
@@ -175,6 +221,19 @@ fun DownloadTaskCard(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            // Surface why a task stopped: the Rust side fills this in and the
+            // UI used to throw it away, leaving the user with a bare "失败".
+            task.errorMsg?.takeIf { it.isNotBlank() }?.let { msg ->
+                Text(
+                    text = msg,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+
             Row(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
@@ -186,18 +245,26 @@ fun DownloadTaskCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                Row {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     if (task.status == 1) {
                         IconButton(onClick = onPause) {
-                            Icon(Icons.Default.Pause, contentDescription = "Pause")
+                            Icon(Icons.Default.Pause, contentDescription = "暂停")
                         }
                     } else if (task.status != 2) {
-                        IconButton(onClick = onPause) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = "Resume")
+                        // Bound to onResume, not onPause: this button used to
+                        // re-pause the task, so a stopped or failed download
+                        // could never be restarted from the manager at all.
+                        IconButton(onClick = onResume) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = "继续下载")
+                        }
+                    }
+                    if (onOpen != null) {
+                        TextButton(onClick = onOpen) {
+                            Text("阅读", fontSize = 13.sp)
                         }
                     }
                     IconButton(onClick = onDelete) {
-                        Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                        Icon(Icons.Default.Delete, contentDescription = "删除", tint = MaterialTheme.colorScheme.error)
                     }
                 }
             }

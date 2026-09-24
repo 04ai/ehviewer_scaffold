@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::{Client, header};
 use tokio::sync::RwLock;
@@ -51,7 +52,15 @@ impl NetworkClient {
             .default_headers(headers)
             .user_agent(user_agent)
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
-            .pool_max_idle_per_host(10)
+            // Keep enough idle connections to survive a burst.
+            //
+            // This is the *idle* pool size, not a concurrency cap, and it was
+            // set to 10 while the app is configured to allow ~96 concurrent
+            // requests per CDN host. After a burst finished, ~86 of those
+            // connections were torn down and the next burst had to redo TCP +
+            // TLS handshakes for each one. 64 keeps a working set warm; the 90 s
+            // idle timeout still reclaims them.
+            .pool_max_idle_per_host(64)
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(120))
             .build()
@@ -158,11 +167,15 @@ impl NetworkClient {
         Ok(html)
     }
 
-    /// Fetch raw bytes for image caching
-    pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+    /// Fetch raw bytes for image caching.
+    ///
+    /// Returns `Bytes` (ref-counted) rather than copying into a `Vec<u8>`.
+    /// reqwest's `Response::bytes()` is already zero-copy; the old
+    /// `.to_vec()` copied the *entire* body again on every single image fetch.
+    pub async fn get_bytes(&self, url: &str) -> Result<Bytes> {
         let res = self.get_with_retry(url).await?;
         let bytes = res.bytes().await?;
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Fetch raw bytes while reporting download progress.
@@ -174,7 +187,7 @@ impl NetworkClient {
         &self,
         url: &str,
         mut on_progress: F,
-    ) -> Result<Vec<u8>>
+    ) -> Result<Bytes>
     where
         F: FnMut(u64, Option<u64>) -> Fut + Send + 'static,
         Fut: futures::Future<Output = ()> + Send + 'static,
@@ -199,7 +212,7 @@ impl NetworkClient {
             }
         }
         on_progress(buf.len() as u64, total).await;
-        Ok(buf)
+        Ok(Bytes::from(buf))
     }
 
     /// POST Form Data

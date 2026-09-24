@@ -12,13 +12,26 @@ import com.example.ehviewer_scaffold.ui.screens.DrawerNavCategory
  * Ensures that returning from GalleryReaderScreen to GalleryDetailScreen
  * immediately renders the detail page from memory (0ms latency, zero network requests,
  * no loading spinner).
+ *
+ * Sized by *weight*, not by entry count: a 500-page gallery carries ~25x the
+ * image URLs, thumbnails and comments of a 20-page one, so counting them equally
+ * let a handful of large galleries evict the rest while still 'fitting' in the
+ * limit. The budget is expressed in thumbnail-pages so the number stays readable.
  */
 object GalleryDetailCache {
-    private val cache = LruCache<String, GalleryDetail>(60)
+    /** Total weight allowed, in units of "pages worth of metadata". */
+    private const val MAX_WEIGHT = 6_000
 
-    fun get(key: String): GalleryDetail? = synchronized(cache) { cache.get(key) }
-    fun put(key: String, detail: GalleryDetail) = synchronized(cache) { cache.put(key, detail) }
-    fun remove(key: String) = synchronized(cache) { cache.remove(key) }
+    private val cache = object : LruCache<String, GalleryDetail>(MAX_WEIGHT) {
+        override fun sizeOf(key: String, value: GalleryDetail): Int =
+            (value.totalPages.coerceAtLeast(1)
+                + value.thumbnails.size
+                + value.comments.size).coerceAtMost(MAX_WEIGHT)
+    }
+
+    fun get(key: String): GalleryDetail? = cache.get(key)
+    fun put(key: String, detail: GalleryDetail) = cache.put(key, detail)
+    fun remove(key: String) = cache.remove(key)
 }
 
 /**
@@ -44,4 +57,33 @@ object HomeStateHolder {
         hasMore = true
         isInitialized = false
     }
+}
+
+/**
+ * In-memory holder for the most recently clicked GalleryItem(s).
+ * Enables instant skeleton rendering with title, cover, uploader, category
+ * the microsecond GalleryDetailScreen is opened.
+ */
+object GalleryPreviewHolder {
+    private val cache = LruCache<String, GalleryItem>(50)
+
+    fun get(gid: String): GalleryItem? = cache.get(gid)
+    fun put(item: GalleryItem) = cache.put(item.gid, item)
+}
+
+/**
+ * In-memory LRU cache for resolved tag translations, keyed by `"$gid/$token"`.
+ *
+ * Every tag translation crosses the JNI boundary into Rust. A gallery can easily
+ * carry 60-120 tags, so re-resolving them on every visit to the detail screen
+ * meant a large batch of native calls on the critical path, stalling the first
+ * frame after navigation. Caching the resolved map per gallery removes that cost
+ * entirely on revisits (tag-search → detail → back → detail is the common loop).
+ */
+object TagTranslationCache {
+    private val cache = LruCache<String, Map<String, String>>(60)
+
+    fun get(key: String): Map<String, String>? = cache.get(key)
+    fun put(key: String, translations: Map<String, String>) = cache.put(key, translations)
+    fun remove(key: String) = cache.remove(key)
 }

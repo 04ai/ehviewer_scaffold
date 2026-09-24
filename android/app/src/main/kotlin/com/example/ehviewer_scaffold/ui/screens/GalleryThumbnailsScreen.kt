@@ -30,7 +30,9 @@ import coil3.request.crossfade
 import com.example.ehviewer_scaffold.rust.EhRustBridge
 import com.example.ehviewer_scaffold.rust.GalleryThumbnail
 import com.example.ehviewer_scaffold.ui.components.EhThumbnail
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -58,7 +60,9 @@ fun GalleryThumbnailsScreen(
         thumbnails.clear()
         nextPageToFetch = 1
         try {
-            val d = EhRustBridge.getGalleryDetail("$gid/$token")
+            val d = withContext(Dispatchers.IO) {
+                EhRustBridge.getGalleryDetail("$gid/$token")
+            }
             totalPages = d.totalPages
             thumbnails.addAll(d.thumbnails)
             if (thumbnails.size >= totalPages || d.thumbnails.isEmpty()) {
@@ -84,7 +88,9 @@ fun GalleryThumbnailsScreen(
         isLoadingMore = true
         scope.launch {
             try {
-                val d = EhRustBridge.getGalleryPage(gid, token, nextPageToFetch)
+                val d = withContext(Dispatchers.IO) {
+                    EhRustBridge.getGalleryPage(gid, token, nextPageToFetch)
+                }
                 if (d.thumbnails.isEmpty()) {
                     hasMore = false
                 } else {

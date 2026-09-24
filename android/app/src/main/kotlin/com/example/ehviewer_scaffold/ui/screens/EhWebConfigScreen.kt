@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.ehviewer_scaffold.ui.settings.AppSettings
 
 @OptIn(ExperimentalMaterial3Api::class)
 @SuppressLint("SetJavaScriptEnabled")
@@ -51,8 +52,16 @@ fun EhWebConfigScreen(
                     webViewClient = WebViewClient()
                     webViewInstance = this
 
-                    // 确保使用当前 Cookie 访问 uconfig.php
-                    loadUrl("https://e-hentai.org/uconfig.php")
+                    // Follow the site setting. This was hard-coded to
+                    // e-hentai.org, so an ExHentai user always landed on the
+                    // wrong host and hit a login wall. Cookies come from the
+                    // process-wide CookieManager, so the session carries over.
+                    val host = if (AppSettings.isExHentai(ctx)) {
+                        "https://exhentai.org"
+                    } else {
+                        "https://e-hentai.org"
+                    }
+                    loadUrl("$host/uconfig.php")
                 }
             },
             modifier = Modifier

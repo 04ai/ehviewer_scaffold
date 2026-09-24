@@ -1,9 +1,12 @@
 use anyhow::Result;
+use bytes::Bytes;
 use crate::network::NetworkClient;
 use crate::parser::{GalleryItem, GalleryDetail, EhWebConfig};
 use crate::cache::CacheEngine;
 use lazy_static::lazy_static;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
 
 lazy_static! {
     static ref NETWORK_CLIENT: Arc<NetworkClient> = Arc::new(NetworkClient::new());
@@ -12,6 +15,58 @@ lazy_static! {
     /// contend only on the µs-scale std::Mutex<MemCache> inside CacheEngine.
     static ref CACHE_ENGINE: Arc<CacheEngine> =
         Arc::new(CacheEngine::new("./.cache".to_string()));
+
+    /// Real-time progress tracker for active reader image downloads (0.0 .. 1.0).
+    ///
+    /// Bounded on purpose — see [`IMAGE_PROGRESS_CAP`]. The key is the full
+    /// viewer URL, so without a cap every page ever opened stays resident for
+    /// the lifetime of the process.
+    static ref IMAGE_PROGRESS: RwLock<HashMap<String, f32>> = RwLock::new(HashMap::new());
+
+    /// Set once an exclusion-only listing query has been refused, so the probe is paid
+    /// at most once per process. See `fetch_gallery_list`.
+    static ref EXCLUSION_ONLY_REJECTED: AtomicBool = AtomicBool::new(false);
+}
+
+/// E-Hentai uses at most the first 8 terms of a search; extras are ignored.
+const EXCLUSION_TERM_BUDGET: usize = 8;
+
+/// Soft cap on tracked viewer URLs.
+///
+/// A reader session only ever polls entries whose image is still loading, so
+/// finished (`1.0`) entries are dead weight. When the map grows past this,
+/// completed entries are swept first; if that is not enough (e.g. hundreds of
+/// genuinely in-flight requests) the map is cleared, which costs at most a
+/// stale progress read for images that are about to be delivered anyway.
+const IMAGE_PROGRESS_CAP: usize = 256;
+
+/// How long a parsed gallery detail may be served from disk before it is
+/// refetched.
+///
+/// Detail is cached mainly for the "open → back → open again" cycle, but it
+/// carries mutable state (rating, favourites count, and whether *this* account
+/// has favourited it). An unbounded entry used to keep answering with a stale
+/// `is_favorited` long after the change, so the detail cache is time-bounded
+/// like the listing cache — just with a longer window, because tag lists and
+/// page counts do not move.
+const DETAIL_CACHE_TTL_SECS: u64 = 120;
+
+/// Retrieve current image download progress for a given viewer page URL (0.0 .. 1.0)
+pub fn get_image_progress(viewer_url: &str) -> f32 {
+    IMAGE_PROGRESS.read().map(|m| m.get(viewer_url).copied().unwrap_or(0.0)).unwrap_or(0.0)
+}
+
+/// Set image download progress for a given viewer page URL
+pub fn set_image_progress(viewer_url: &str, progress: f32) {
+    if let Ok(mut m) = IMAGE_PROGRESS.write() {
+        m.insert(viewer_url.to_string(), progress);
+        if m.len() > IMAGE_PROGRESS_CAP {
+            m.retain(|_, v| *v < 1.0);
+            if m.len() > IMAGE_PROGRESS_CAP {
+                m.clear();
+            }
+        }
+    }
 }
 
 /// A basic health check to ensure Dart <-> Rust FFI is working
@@ -24,6 +79,19 @@ pub async fn health_check(name: String) -> String {
 /// the built-in hosts feature was removed (DNS is used as-is).
 pub async fn init_backend(cache_dir: String, enable_eh_host: bool) -> Result<()> {
     let _ = enable_eh_host; // kept for API compatibility, no longer used
+
+    // Rust does not install a logger by default, which on Android meant every
+    // `log::*` in this crate was compiled in but thrown away — hundreds of
+    // diagnostics that never once reached logcat. `init_once` is idempotent,
+    // so repeated backend inits (activity restarts) are harmless.
+    let _ = android_logger::init_once(
+        android_logger::Config::default()
+            .with_tag("EhRust")
+            // Info keeps the hot image path quiet: nothing in this crate logs
+            // above Debug on a per-poll / per-frame cadence.
+            .with_max_level(log::LevelFilter::Info),
+    );
+
     // CacheEngine uses interior mutability — no outer lock needed.
     CACHE_ENGINE.set_disk_path(cache_dir.clone());
     CACHE_ENGINE.init_disk_cache().await?;
@@ -37,8 +105,43 @@ pub async fn init_backend(cache_dir: String, enable_eh_host: bool) -> Result<()>
         .unwrap_or(&cache_dir);
     crate::downloader::init_downloader(downloads_parent).await;
 
+    // Load the gallery→tags index that backs blocked-tag filtering. The block
+    // list itself arrives later from Kotlin via `set_blocked_tags` (it is
+    // replayed at cold start, like the site URL and the download directory).
+    crate::blocked::init_index(&cache_dir);
+
     log::info!("Backend initialized.");
     Ok(())
+}
+
+/// Replace the blocked-tag list. Kotlin's SharedPreferences stays authoritative;
+/// this is in-memory state replayed on cold start.
+pub fn set_blocked_tags(tags: Vec<String>) {
+    crate::blocked::set_blocked_tags(tags);
+}
+
+/// Keep only the gids that are not blocked.
+///
+/// Used when the block list changes while a list is already on screen: the UI
+/// drops the newly blocked galleries from what it has, instead of refetching the
+/// whole page (which would also throw away the scroll position).
+pub fn filter_blocked_ids(gids: Vec<String>) -> Vec<String> {
+    if !crate::blocked::has_blocked() {
+        return gids;
+    }
+    let before = gids.len();
+    let kept: Vec<String> = gids
+        .into_iter()
+        .filter(|g| !crate::blocked::is_gallery_blocked(g))
+        .collect();
+    if kept.len() != before {
+        log::info!(
+            "Blocked-tag filter dropped {} of {} already-listed galleries",
+            before - kept.len(),
+            before
+        );
+    }
+    kept
 }
 
 /// Sync cookies from Flutter WebView to Rust Reqwest client
@@ -59,14 +162,6 @@ pub async fn set_site_url(url: String) -> Result<()> {
     Ok(())
 }
 
-/// Configure network client. Kept for API compatibility; the built-in
-/// hosts feature was removed, so both flags are ignored (DNS used as-is).
-pub async fn configure_network(enable_eh_host: bool, enable_ex_host: bool) -> Result<()> {
-    let _ = (enable_eh_host, enable_ex_host); // kept for API compatibility, no longer used
-    NETWORK_CLIENT.rebuild_client().await;
-    Ok(())
-}
-
 pub async fn download_tag_db(path: String) -> Result<()> {
     crate::tag_translator::download_tag_db(path).await
 }
@@ -79,8 +174,131 @@ pub fn translate_tag_sync(namespace: String, tag: String) -> String {
     crate::tag_translator::translate_tag_sync(namespace, tag)
 }
 
+/// Translate a whole batch of `(namespace, tag)` pairs in a single call.
+///
+/// A gallery routinely carries 60–120 tags, and each individual
+/// [`translate_tag_sync`] costs one JNI transition plus one `TAG_DB` read-lock
+/// acquisition. Calling across the boundary once per tag meant 60–120
+/// transitions just to render a detail page; this collapses it to one.
+///
+/// Keys are `"namespace:tag"`, matching the map the detail screen indexes.
+/// Values fall back to the raw tag when there is no translation, so callers
+/// never have to handle an empty string.
+pub fn translate_tags_batch(pairs: Vec<(String, String)>) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(pairs.len());
+    for (ns, tag) in pairs {
+        let key = format!("{}:{}", ns, tag);
+        let translated = crate::tag_translator::translate_tag_sync(ns, tag.clone());
+        out.insert(key, if translated.is_empty() { tag } else { translated });
+    }
+    out
+}
+
 pub fn search_tag_by_chinese(keyword: String) -> Vec<crate::tag_translator::TagSuggestion> {
     crate::tag_translator::search_tag_by_chinese(keyword)
+}
+
+/// Ask E-Hentai itself what tags start with `keyword`.
+///
+/// This is `POST {site}/api.php` with `{"method":"tagsuggest","text":...}`,
+/// returning entries shaped like `{"ns":"female","tn":"kafka"}`.
+///
+/// Unlike the bundled translation database this needs **no download** and
+/// covers E-Hentai's full vocabulary, including the long tail of tags the
+/// curated database never includes. Network failures return an empty list so
+/// the caller falls back to local sources.
+pub async fn suggest_tags_online(keyword: String) -> Result<Vec<crate::tag_translator::TagSuggestion>> {
+    let kw = keyword.trim();
+    if kw.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let site_url = NETWORK_CLIENT.get_site_url().await;
+    let url = format!("{}/api.php", site_url);
+    let body = serde_json::json!({ "method": "tagsuggest", "text": kw });
+
+    let response = match NETWORK_CLIENT.post_json(&url, &body).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Expected offline / when the site is unreachable: this is a
+            // suggestion source, never a correctness requirement.
+            log::debug!("tagsuggest failed: {}", e);
+            return Ok(Vec::new());
+        }
+    };
+
+    let value: serde_json::Value = match serde_json::from_str(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            // Warn, not debug: reaching here means the endpoint answered but
+            // not with JSON, so the request itself worked and our assumption
+            // about the payload is what is wrong.
+            log::warn!("tagsuggest response was not JSON: {}", e);
+            return Ok(Vec::new());
+        }
+    };
+
+    // E-Hentai has shipped more than one shape for this endpoint: a bare array
+    // of entries, and an object carrying them under "tags". Only the object
+    // form was implemented, so a bare array fell into `_` and returned an
+    // empty list — the online completion source silently contributed nothing.
+    // Accept the top level too, and keep the object-with-keys form working.
+    let entries: Vec<TagSuggestEntry> = {
+        let container = value.get("tags").unwrap_or(&value);
+        match container {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|e| serde_json::from_value::<TagSuggestEntry>(e.clone()).ok())
+                .collect(),
+            serde_json::Value::Object(map) => map
+                .values()
+                .filter_map(|e| serde_json::from_value::<TagSuggestEntry>(e.clone()).ok())
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let tag = entry.tn.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        let ns = entry.ns.trim();
+        let raw = if ns.is_empty() {
+            tag.to_string()
+        } else {
+            format!("{}:{}", ns, tag)
+        };
+        let translated = if ns.is_empty() {
+            String::new()
+        } else {
+            crate::tag_translator::translate_tag_sync(ns.to_string(), tag.to_string())
+        };
+        out.push(crate::tag_translator::TagSuggestion { raw, translated });
+    }
+
+    if out.is_empty() {
+        // The endpoint answered but nothing was parseable — log the head of the
+        // payload so a future shape change is diagnosable from logcat instead
+        // of looking like "the site has no tag for this".
+        log::warn!(
+            "tagsuggest('{}') yielded no suggestions; payload head: {}",
+            kw,
+            response.chars().take(120).collect::<String>()
+        );
+    } else {
+        log::info!("tagsuggest('{}') → {} suggestions", kw, out.len());
+    }
+    Ok(out)
+}
+
+#[derive(serde::Deserialize)]
+struct TagSuggestEntry {
+    #[serde(default)]
+    ns: String,
+    #[serde(default)]
+    tn: String,
 }
 
 /// Fetch the E-Hentai front page and parse real gallery data
@@ -102,7 +320,7 @@ pub async fn fetch_front_page(query: Option<String>, options: Option<SearchOptio
             match crate::parser::parse_gallery_list(&html) {
                 Ok(page_data) if !page_data.items.is_empty() => {
                     log::info!("Parsed {} gallery items from front page", page_data.items.len());
-                    page_data.items
+                    crate::blocked::filter_blocked(page_data.items)
                 }
                 Ok(_) => {
                     // Page loaded but no items - show what we actually got
@@ -156,25 +374,152 @@ fn build_search_query_string(url: &mut String, query: Option<String>, options: O
 }
 
 /// Fetch paginated gallery list (home page and search)
-pub async fn fetch_gallery_list(page: u32, page_url: Option<String>, query: Option<String>, options: Option<SearchOptions>) -> Result<crate::parser::GalleryPage> {
+pub async fn fetch_gallery_list(page: u32, page_url: Option<String>, query: Option<String>, options: Option<SearchOptions>, force_refresh: bool) -> Result<crate::parser::GalleryPage> {
     let site_url = NETWORK_CLIENT.get_site_url().await;
-    
+
+    let paged_by_url = page_url.is_some();
     let url = if let Some(u) = page_url {
         // If a specific next/prev URL is provided, use it directly! (E-Hentai's next= pagination)
         u
     } else {
         // Fallback to traditional page numbers for first page or jump
         let mut u = format!("{}/?page={}", site_url, page);
-        build_search_query_string(&mut u, query, options);
+        build_search_query_string(&mut u, query.clone(), options.clone());
         u
     };
 
-    let html = NETWORK_CLIENT.get_html(&url).await?;
-    crate::parser::parse_gallery_list(&html)
+    // Kept at info level rather than removed: this one line is what localised a cold-start
+    // race where the block list had not reached Rust yet, which made the probe below look
+    // like it simply never ran. It only fires for page 0.
+    if page == 0 {
+        log::info!(
+            "Listing probe: paged_by_url={} query_empty={} blocked={} disabled={}",
+            paged_by_url,
+            query.as_deref().unwrap_or("").trim().is_empty(),
+            crate::blocked::has_blocked(),
+            EXCLUSION_ONLY_REJECTED.load(Ordering::Relaxed)
+        );
+    }
+
+    // No user query, first page, and something is blocked: try to make the *server*
+    // filter the listing, instead of only being able to filter the galleries this
+    // device has already opened (a listing carries no tags — see `blocked`).
+    //
+    // E-Hentai's search documentation says "Searches with only exclusions are not
+    // permitted", but that could never be verified from here, and if it does work the
+    // whole feature becomes complete at zero extra traffic. So it is probed once; a
+    // refusal is remembered for the process lifetime, and the fallback below is the
+    // ordinary listing, so a failed probe costs one extra request and nothing else.
+    if !paged_by_url
+        && page == 0
+        && query.as_deref().unwrap_or("").trim().is_empty()
+        && crate::blocked::has_blocked()
+        && !EXCLUSION_ONLY_REJECTED.load(Ordering::Relaxed)
+    {
+        let terms = crate::blocked::exclusion_terms(EXCLUSION_TERM_BUDGET);
+        log::info!("exclusion-only probe: {} terms", terms.len());
+        if !terms.is_empty() {
+            let mut trial = format!("{}/?page=0", site_url);
+            build_search_query_string(&mut trial, Some(terms.join(" ")), options.clone());
+            match fetch_list_with_cache(&trial, force_refresh).await {
+                Ok(p) if !p.items.is_empty() => {
+                    log::info!(
+                        "Exclusion-only listing accepted: {} items, {} block terms applied server-side",
+                        p.items.len(),
+                        terms.len()
+                    );
+                    return Ok(p);
+                }
+                Ok(_) => {
+                    // The server took the query and returned nothing: that is the
+                    // documented refusal, so stop probing for this process.
+                    log::warn!(
+                        "Exclusion-only listing refused (as documented); falling back to the \
+                         unfiltered listing. List-side filtering still applies to galleries \
+                         that have been opened."
+                    );
+                    EXCLUSION_ONLY_REJECTED.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // A transport failure is NOT a refusal — remembering it would let one
+                    // flaky request disable server-side filtering for the whole process.
+                    log::warn!("Exclusion-only probe failed, will retry next time: {}", e);
+                }
+            }
+        }
+    }
+
+    fetch_list_with_cache(&url, force_refresh).await
+}
+
+/// How long a gallery list may be served from disk before it is refetched.
+///
+/// Short on purpose. This exists so that *coming back* is instant — returning
+/// from a long read, or the process being recreated after the OS reclaimed it,
+/// used to refetch the front page and re-download every thumbnail. Minutes, not
+/// hours: the feed does move, and a search result set must not go stale.
+const LIST_CACHE_TTL_SECS: u64 = 300;
+
+/// Shared by the normal and custom list paths: TTL-cached parse of one listing.
+/// Fetch a listing and serve it from the TTL cache when possible, **without**
+/// blocked-tag filtering. See [`fetch_list_with_cache`] for the filtered entry
+/// point the UI actually calls.
+async fn fetch_list_cached_raw(url: &str, max_age_secs: u64) -> Result<crate::parser::GalleryPage> {
+    let cache_key = format!("list:{}", url);
+
+    // `max_age_secs == 0` means "do not serve from cache at all" — that is what an
+    // explicit pull-to-refresh asks for. Without it, a refresh inside the TTL window
+    // returned the very same 25 items in a few milliseconds, which looked like the
+    // refresh button did nothing (and there was no log line to argue otherwise,
+    // because the cache-hit path never touches the network). The fresh response is
+    // still written back below, so the next ordinary read stays warm.
+    if max_age_secs > 0 {
+        if let Ok(Some(bytes)) = CACHE_ENGINE
+            .get_cached_within(&cache_key, max_age_secs)
+            .await
+        {
+            if let Ok(cached) = serde_json::from_slice::<crate::parser::GalleryPage>(&bytes) {
+                if !cached.items.is_empty() {
+                    log::info!("List cache hit ({} items): {}", cached.items.len(), url);
+                    return Ok(cached);
+                }
+            }
+        }
+    } else {
+        log::info!("List cache bypassed (forced refresh): {}", url);
+    }
+
+    let html = NETWORK_CLIENT.get_html(url).await?;
+    let page = crate::parser::parse_gallery_list(&html)?;
+
+    // Cache the *parsed* page, not the HTML: re-parsing 60 KB of markup on every
+    // re-entry was most of the cost of "coming back".
+    if let Ok(json_bytes) = serde_json::to_vec(&page) {
+        let _ = CACHE_ENGINE.store(&cache_key, &json_bytes).await;
+    }
+
+    Ok(page)
+}
+
+/// The listing entry point the UI uses: raw listing, then blocked-tag filter.
+///
+/// The filter runs on the way *out*, after the raw page has been cached, so the
+/// cache keeps the server's real response. Filtering before the cache write
+/// would mean un-blocking a tag left the gallery missing until the TTL expired.
+///
+/// Reminder on coverage: a listing carries no tags, so only galleries whose tags
+/// this device has already seen (i.e. opened at least once) can be filtered here.
+/// When the user typed a query, the Kotlin layer additionally appends the blocked
+/// tags as `-ns:tag` exclusions and the server filters the whole result set.
+async fn fetch_list_with_cache(url: &str, force_refresh: bool) -> Result<crate::parser::GalleryPage> {
+    let max_age = if force_refresh { 0 } else { LIST_CACHE_TTL_SECS };
+    let mut page = fetch_list_cached_raw(url, max_age).await?;
+    page.items = crate::blocked::filter_blocked(std::mem::take(&mut page.items));
+    Ok(page)
 }
 
 /// Fetch a custom gallery list (like watched, popular, toplist, favorites)
-pub async fn fetch_custom_list(path: String, page: u32, page_url: Option<String>, query: Option<String>, options: Option<SearchOptions>) -> Result<crate::parser::GalleryPage> {
+pub async fn fetch_custom_list(path: String, page: u32, page_url: Option<String>, query: Option<String>, options: Option<SearchOptions>, force_refresh: bool) -> Result<crate::parser::GalleryPage> {
     let site_url = NETWORK_CLIENT.get_site_url().await;
 
     let base_url = if path.is_empty() {
@@ -196,8 +541,9 @@ pub async fn fetch_custom_list(path: String, page: u32, page_url: Option<String>
         u
     };
 
-    let html = NETWORK_CLIENT.get_html(&url).await?;
-    let mut result = crate::parser::parse_gallery_list(&html)?;
+    // Same TTL-cached path as the normal listing; the next_url fix-up below is
+    // derived from the URL, so it applies identically to cached and fresh pages.
+    let mut result = fetch_list_with_cache(&url, force_refresh).await?;
 
     // Some pages (e.g. toplist.php) don't emit next= links; paginate by
     // page number so "load more" keeps working.
@@ -217,7 +563,29 @@ pub async fn fetch_custom_list(path: String, page: u32, page_url: Option<String>
 pub async fn fetch_gallery_detail(id: String) -> Result<GalleryDetail> {
     let site_url = NETWORK_CLIENT.get_site_url().await;
     let url = format!("{}/g/{}", site_url, id);
-    
+    let cache_key = format!("detail:{}", id);
+
+    // 1. Fast L2 Disk cache lookup for detail — time-bounded, see
+    //    DETAIL_CACHE_TTL_SECS for why this one cannot be unbounded.
+    if let Ok(Some(cached_bytes)) = CACHE_ENGINE
+        .get_cached_within(&cache_key, DETAIL_CACHE_TTL_SECS)
+        .await
+    {
+        if let Ok(cached_detail) = serde_json::from_slice::<GalleryDetail>(&cached_bytes) {
+            if !cached_detail.title.is_empty() {
+                // Learn from cached opens too: re-visiting a gallery is exactly
+                // the case where its tags are worth remembering, and skipping
+                // it here would keep the index empty for everything the user
+                // had already browsed before this build.
+                crate::tag_translator::learn_tags(&cached_detail.tag_groups);
+                // Same reasoning for the blocked-tag index: this is what lets a
+                // blocked gallery disappear from listings.
+                crate::blocked::record_tags(&id, &cached_detail.tag_groups);
+                return Ok(cached_detail);
+            }
+        }
+    }
+
     let html = match NETWORK_CLIENT.get_html(&url).await {
         Ok(html) => html,
         Err(e) => {
@@ -228,7 +596,7 @@ pub async fn fetch_gallery_detail(id: String) -> Result<GalleryDetail> {
 
     let detail = match crate::parser::parse_gallery_detail(&html) {
         Ok(mut d) => {
-            d.id = id;
+            d.id = id.clone();
             d
         }
         Err(e) => {
@@ -237,19 +605,35 @@ pub async fn fetch_gallery_detail(id: String) -> Result<GalleryDetail> {
         }
     };
 
+    // Feed English autocomplete: these are tags that provably exist on
+    // E-Hentai, learned with no download required from the user.
+    crate::tag_translator::learn_tags(&detail.tag_groups);
+    // And remember which tags this gallery carries, so blocked-tag filtering can
+    // act on it in listings from now on.
+    crate::blocked::record_tags(&id, &detail.tag_groups);
+
+    // Store in disk cache for instant subsequent opens
+    if let Ok(json_bytes) = serde_json::to_vec(&detail) {
+        let _ = CACHE_ENGINE.store(&cache_key, &json_bytes).await;
+    }
+
     // Spawn background preloader for the first 3 images.
-    // Viewer page URLs are resolved to real image URLs first, then fetched
-    // through the same cache path the reader uses (get_image), so the
-    // preload actually warms the cache the reader reads from.
+    //
+    // Runs through `fetch_and_cache_image` — the exact path the reader uses —
+    // so the preload warms the *same cache keys* the reader will look up
+    // (viewer URLs). Warming resolved URLs here would leave the reader with a
+    // cold cache while having paid for the download.
+    //
+    // Concurrent, not sequential: the previous `for ... await` loop cost three
+    // round-trips of latency end to end, which is precisely the delay before
+    // the first pages paint.
     let urls = detail.image_urls.clone();
-    let client = Arc::clone(&NETWORK_CLIENT);
-    let cache = Arc::clone(&CACHE_ENGINE);
     tokio::spawn(async move {
-        for url in urls.iter().take(3) {
-            if let Ok(real_url) = resolve_image_url(url.clone()).await {
-                let _ = fetch_image_cached(&real_url, &cache, &client).await;
-            }
-        }
+        let warm = urls
+            .iter()
+            .take(3)
+            .map(|url| fetch_and_cache_image(url.clone()));
+        futures::future::join_all(warm).await;
     });
 
     Ok(detail)
@@ -259,66 +643,51 @@ pub async fn fetch_gallery_detail(id: String) -> Result<GalleryDetail> {
 pub async fn fetch_gallery_page(id: String, token: String, page: u32) -> Result<GalleryDetail> {
     let site_url = NETWORK_CLIENT.get_site_url().await;
     let url = format!("{}/g/{}/{}/?p={}", site_url, id, token, page);
-    
+    let cache_key = format!("page:{}:{}:{}", id, token, page);
+
+    if let Ok(Some(cached_bytes)) = CACHE_ENGINE.get_cached(&cache_key).await {
+        if let Ok(cached_page) = serde_json::from_slice::<GalleryDetail>(&cached_bytes) {
+            if !cached_page.image_urls.is_empty() {
+                return Ok(cached_page);
+            }
+        }
+    }
+
     let html = NETWORK_CLIENT.get_html(&url).await?;
     let mut detail = crate::parser::parse_gallery_detail(&html)?;
     detail.id = id;
-    
+
+    if let Ok(json_bytes) = serde_json::to_vec(&detail) {
+        let _ = CACHE_ENGINE.store(&cache_key, &json_bytes).await;
+    }
+
     Ok(detail)
 }
 
-/// Fetch image bytes, using L1 (Memory) + L2 (Disk) caching.
-/// The global cache lock is only held for the (fast) cache read/write, never
-/// across a network request, so one slow image cannot block other loads.
-pub async fn get_image(url: String) -> Result<Vec<u8>> {
+/// Fetch image bytes, using L2 (disk) caching.
+/// The cache read/write is self-synchronizing, never held across a network
+/// request, so one slow image cannot block other loads.
+pub async fn get_image(url: String) -> Result<Bytes> {
     fetch_image_cached(&url, &CACHE_ENGINE, &NETWORK_CLIENT).await
 }
 
-/// Fetch image bytes (L1/L2/L3 cache-aware) while reporting download
-/// progress via [on_progress], called with `(downloaded_bytes, total_bytes)`
-/// after each received chunk. `total` is `None` when the server omits
-/// Content-Length. Cache hits report instant 100% completion.
-pub async fn get_image_with_progress<F, Fut>(
-    url: String,
-    on_progress: F,
-) -> Result<Vec<u8>>
-where
-    F: Fn(u64, Option<u64>) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    // L1 + L2: memory / disk cache hit → complete instantly.
-    if let Some(bytes) = CACHE_ENGINE.get_cached(&url).await? {
-        on_progress(bytes.len() as u64, Some(bytes.len() as u64)).await;
-        return Ok(bytes.to_vec());
-    }
-
-    // L3: network fetch, reporting progress chunk-by-chunk.
-    let bytes = NETWORK_CLIENT
-        .get_bytes_with_progress(&url, on_progress)
-        .await?;
-
-    // Persist to memory + disk (HTML error bodies are rejected inside store()).
-    let _ = CACHE_ENGINE.store(&url, &bytes).await;
-
-    Ok(bytes)
-}
-
-/// L1 + L2 + L3 cache-aware fetch.
+/// L2 + L3 cache-aware fetch.
 /// `cache` is `&Arc<CacheEngine>` — no outer lock; CacheEngine is self-synchronizing.
 async fn fetch_image_cached(
     url: &str,
     cache: &Arc<CacheEngine>,
     network: &Arc<NetworkClient>,
-) -> Result<Vec<u8>> {
-    // L1 + L2: memory / disk hit (no outer lock — CacheEngine is self-synchronizing)
+) -> Result<Bytes> {
+    // L2: disk hit — returned as-is, no copy
     if let Some(bytes) = cache.get_cached(url).await? {
-        return Ok(bytes.to_vec());
+        return Ok(bytes);
     }
 
     // L3: network fetch (fully concurrent — no cache lock held during I/O)
     let bytes = network.get_bytes(url).await?;
 
-    // Persist to memory + disk (HTML error bodies are rejected inside store())
+    // Persist to disk (HTML error bodies are rejected inside store()).
+    // `store` writes from the slice, so this does not consume `bytes`.
     let _ = cache.store(url, &bytes).await;
 
     Ok(bytes)
@@ -333,6 +702,8 @@ fn error_items(msg: String) -> Vec<GalleryItem> {
         category: "Error".to_string(),
         uploader: "System".to_string(),
         post_date: "".to_string(),
+        thumb_width: 0,
+        thumb_height: 0,
     }]
 }
 
@@ -354,73 +725,173 @@ pub async fn resolve_image_url(viewer_url: String) -> Result<String> {
 /// This makes Coil act as a pure local decoder: all EH-specific session management
 /// (cookies, UA, proxy, nl-retry) is handled exclusively by the Rust network layer.
 pub async fn fetch_and_cache_image(viewer_url: String) -> Result<String> {
-    // Step 1: resolve viewer page → real image URL
-    let real_url = resolve_image_url(viewer_url.clone()).await?;
+    set_image_progress(&viewer_url, 0.05);
 
-    // Step 2: check disk cache first (avoid re-downloading already-fetched images)
-    // get_disk_file_path acquires a ns-scale read-lock internally; no outer lock needed.
-    let cache_file = CACHE_ENGINE.get_disk_file_path(&real_url);
-
+    // Step 1: check the disk cache FIRST, keyed by the *viewer* URL.
+    //
+    // This ordering is the whole point. The cache used to be keyed by the
+    // resolved CDN URL, and resolving means fetching the viewer HTML page — so
+    // even a fully-cached gallery still paid one HTML request per page just to
+    // discover the key it already knew. Reopening a 200-page gallery re-fetched
+    // 200 pages from the network for nothing.
+    //
+    // The reader identifies pages by viewer URL, so that value is known before
+    // any I/O, and it is stable for a given page. Keying on it makes a warm
+    // reopen literally zero network requests.
+    //
+    // Note the downloader deliberately keeps using resolved URLs as keys (it
+    // never sees viewer URLs) and evicts its own entries when a gallery
+    // finishes, so the two conventions do not fight over the same bytes.
+    let cache_file = CACHE_ENGINE.get_disk_file_path(&viewer_url);
     if cache_file.exists() {
+        set_image_progress(&viewer_url, 1.0);
         return Ok(format!("file://{}", cache_file.to_string_lossy()));
     }
 
-    // Step 3: fetch with nl-retry on quota/stale-key errors
-    let bytes = fetch_with_nl_retry(&real_url, &viewer_url).await?;
+    // Step 2: cache miss — resolve viewer page → real CDN image URL.
+    let real_url = resolve_image_url(viewer_url.clone()).await?;
+    set_image_progress(&viewer_url, 0.15);
 
-    // Step 4: persist to LRU disk cache (store is self-synchronizing, no outer lock)
-    let _ = CACHE_ENGINE.store(&real_url, &bytes).await;
+    // Step 3: fetch with nl-retry on quota/stale-key errors.
+    let bytes = fetch_with_nl_retry(&real_url, &viewer_url).await?;
+    set_image_progress(&viewer_url, 0.98);
+
+    // Step 4: persist under the viewer-URL key so step 1 hits next time.
+    let _ = CACHE_ENGINE.store(&viewer_url, &bytes).await;
+    set_image_progress(&viewer_url, 1.0);
 
     // Step 5: return file:// URI so Coil reads from disk
     Ok(format!("file://{}", cache_file.to_string_lossy()))
 }
 
+async fn fetch_bytes_reporting_progress(url: &str, viewer_url: &str) -> Result<Bytes> {
+    let vu = viewer_url.to_string();
+    NETWORK_CLIENT.get_bytes_with_progress(url, move |downloaded, total_opt| {
+        let u = vu.clone();
+        async move {
+            if let Some(total) = total_opt {
+                if total > 0 {
+                    let ratio = (downloaded as f32) / (total as f32);
+                    let p = 0.15 + 0.80 * ratio.clamp(0.0, 1.0);
+                    set_image_progress(&u, p);
+                }
+            }
+        }
+    }).await
+}
+
 /// Fetch image bytes from the real URL, retrying with an `nl` reload parameter
 /// when the server returns a quota-exceeded / stale-key error response.
-///
 /// E-Hentai returns HTTP 200 with an HTML error page or a redirect for expired
-/// image keys. We detect the HTML body and re-resolve via `?nl=1` which forces
-/// the server to issue a new image key assignment.
-async fn fetch_with_nl_retry(real_url: &str, viewer_url: &str) -> Result<Vec<u8>> {
+/// image keys. We detect the HTML body and re-resolve via dynamic `nl` tokens
+/// parsed from `#loadfail` onclick, allowing source-switching across retries.
+async fn fetch_with_nl_retry(real_url: &str, viewer_url: &str) -> Result<Bytes> {
     // First attempt
-    match NETWORK_CLIENT.get_bytes(real_url).await {
+    match fetch_bytes_reporting_progress(real_url, viewer_url).await {
         Ok(b) if !b.is_empty() && !b.starts_with(b"<") => return Ok(b),
         Ok(_) | Err(_) => {
             log::warn!(
-                "fetch_with_nl_retry: first attempt failed or returned HTML for {}; retrying with nl=1",
+                "fetch_with_nl_retry: first attempt failed or returned HTML for {}; attempting nl reload",
                 real_url
             );
         }
     }
 
-    // nl=1 retry: re-resolve with the reload parameter so EH issues a fresh image key
-    let nl_url = append_nl_param(viewer_url);
-    let html = NETWORK_CLIENT.get_html(&nl_url).await
-        .map_err(|e| anyhow::anyhow!("nl-retry: failed to reload viewer page: {}", e))?;
-    let new_real_url = crate::parser::parse_image_url(&html)
-        .map_err(|e| anyhow::anyhow!("nl-retry: failed to parse new image URL: {}", e))?;
+    // nl dynamic retry loop (up to 2 rounds of source-switching)
+    let mut current_viewer_url = viewer_url.to_string();
+    let mut last_error = anyhow::anyhow!("nl-retry: image unavailable");
 
-    let bytes = NETWORK_CLIENT.get_bytes(&new_real_url).await
-        .map_err(|e| anyhow::anyhow!("nl-retry: failed to fetch new image URL {}: {}", new_real_url, e))?;
+    for attempt in 1..=2 {
+        // Courteous backoff between retries to avoid triggering 509 Bandwidth Exceeded / IP rate limits
+        if attempt > 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
 
-    if bytes.is_empty() || bytes.starts_with(b"<") {
-        return Err(anyhow::anyhow!("nl-retry: still got HTML/empty after reload — image may be unavailable"));
+        let viewer_html = match NETWORK_CLIENT.get_html(&current_viewer_url).await {
+            Ok(h) => h,
+            Err(e) => {
+                last_error = anyhow::anyhow!("nl-retry: failed to read viewer page {}: {}", current_viewer_url, e);
+                break;
+            }
+        };
+
+        let nl_token = crate::parser::parse_nl_token(&viewer_html);
+        let nl_url = match &nl_token {
+            Some(tok) => append_nl_param(&current_viewer_url, tok),
+            None => {
+                log::warn!("nl-retry: no nl token found in viewer page {}", current_viewer_url);
+                current_viewer_url.clone()
+            }
+        };
+
+        let target_html = if nl_url != current_viewer_url {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            match NETWORK_CLIENT.get_html(&nl_url).await {
+                Ok(h) => {
+                    current_viewer_url = nl_url;
+                    h
+                }
+                Err(e) => {
+                    last_error = anyhow::anyhow!("nl-retry: failed to reload viewer with nl: {}", e);
+                    continue;
+                }
+            }
+        } else {
+            viewer_html
+        };
+
+        let new_real_url = match crate::parser::parse_image_url(&target_html) {
+            Ok(u) => u,
+            Err(e) => {
+                last_error = anyhow::anyhow!("nl-retry: failed to parse image url: {}", e);
+                continue;
+            }
+        };
+
+        match fetch_bytes_reporting_progress(&new_real_url, viewer_url).await {
+            Ok(bytes) if !bytes.is_empty() && !bytes.starts_with(b"<") => {
+                // Deliberately does NOT cache here. The cache key is the
+                // caller's choice: `fetch_and_cache_image` keys by viewer URL
+                // while the downloader keys by resolved URL, and this helper
+                // cannot know which convention applies. Letting it store under
+                // `new_real_url` too would create a second, unfindable copy.
+                return Ok(bytes);
+            }
+            Ok(_) => {
+                last_error = anyhow::anyhow!("nl-retry (attempt {}): returned HTML instead of image data", attempt);
+            }
+            Err(e) => {
+                last_error = anyhow::anyhow!("nl-retry (attempt {}): request failed: {}", attempt, e);
+            }
+        }
     }
 
-    // Cache under the new real URL so future requests skip the viewer page.
-    let _ = CACHE_ENGINE.store(&new_real_url, &bytes).await;
-
-    Ok(bytes)
+    Err(last_error)
 }
 
-/// Appends `nl=1` reload parameter to a viewer URL.
-fn append_nl_param(viewer_url: &str) -> String {
-    if viewer_url.contains('?') {
-        format!("{}&nl=1", viewer_url)
+/// Appends the real `nl={token}` reload parameter to a viewer URL,
+/// cleanly stripping any existing stale `nl=...` query parameter.
+fn append_nl_param(viewer_url: &str, token: &str) -> String {
+    let clean_url = if let Some(idx) = viewer_url.find("nl=") {
+        let before = &viewer_url[..idx];
+        let after = &viewer_url[idx..];
+        let end_idx = after.find('&').map(|e| idx + e + 1).unwrap_or(viewer_url.len());
+        let before_clean = before.trim_end_matches('&').trim_end_matches('?');
+        let after_clean = &viewer_url[end_idx..];
+        if after_clean.is_empty() {
+            before_clean.to_string()
+        } else if before_clean.contains('?') {
+            format!("{}&{}", before_clean, after_clean)
+        } else {
+            format!("{}?{}", before_clean, after_clean)
+        }
     } else {
-        format!("{}?nl=1", viewer_url)
-    }
+        viewer_url.to_string()
+    };
+    let sep = if clean_url.contains('?') { '&' } else { '?' };
+    format!("{}{}nl={}", clean_url, sep, token)
 }
+
 
 /// Collect the full viewer-URL list for a gallery by walking every ?p=N page,
 /// starting from page 1 (page 0's URLs are already in `current`). Stops once
@@ -470,6 +941,17 @@ pub async fn start_download(
 pub async fn pause_download(gid: String) -> Result<()> {
     crate::downloader::pause_download(gid).await?;
     Ok(())
+}
+
+/// Restart a stopped or failed download from its stored page list.
+pub async fn resume_download(gid: String) -> Result<()> {
+    crate::downloader::resume_download(gid).await
+}
+
+/// Absolute paths of a gallery's downloaded pages, in page order. Empty when
+/// the gallery has nothing on disk. Backs the offline reader.
+pub async fn get_downloaded_pages(gid: String) -> Vec<String> {
+    crate::downloader::get_downloaded_pages(&gid).await
 }
 
 pub async fn get_download_tasks() -> Vec<crate::downloader::DownloadTask> {
@@ -845,38 +1327,6 @@ pub async fn fetch_more_comments(gid: String, token: String, page: u32) -> Vec<c
     }
 }
 
-/// Rate a gallery via api.php
-pub async fn rate_gallery(gid: u64, token: String, rating: u32, apiuid: u64, apikey: String) -> Result<String> {
-    let site_url = NETWORK_CLIENT.get_site_url().await;
-    let url = format!("{}/api.php", site_url);
-    
-    let payload = serde_json::json!({
-        "method": "rategallery",
-        "apiuid": apiuid,
-        "apikey": apikey,
-        "gid": gid,
-        "token": token,
-        "rating": rating
-    });
-    
-    let res = NETWORK_CLIENT.post_json(&url, &payload).await?;
-    Ok(res)
-}
-
-/// Fetch tag autocomplete suggestions
-pub async fn fetch_autocomplete(prefix: String) -> Result<String> {
-    let site_url = NETWORK_CLIENT.get_site_url().await;
-    let url = format!("{}/api.php", site_url);
-    
-    let payload = serde_json::json!({
-        "method": "tagsuggest",
-        "text": prefix
-    });
-    
-    let res = NETWORK_CLIENT.post_json(&url, &payload).await?;
-    Ok(res)
-}
-
 /// Fetch user configuration from uconfig.php
 pub async fn fetch_eh_web_config() -> Result<EhWebConfig> {
     let site_url = NETWORK_CLIENT.get_site_url().await;
@@ -888,21 +1338,9 @@ pub async fn fetch_eh_web_config() -> Result<EhWebConfig> {
     crate::parser::parse_eh_web_config(&html)
 }
 
-/// Save user configuration to uconfig.php
-pub async fn save_eh_web_config(params: Vec<(String, String)>) -> Result<String> {
-    let site_url = NETWORK_CLIENT.get_site_url().await;
-    let url = format!("{}/uconfig.php", site_url);
-    let form_fields: Vec<(&str, &str)> = params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let res = NETWORK_CLIENT.post_form(&url, &form_fields).await?;
-    if res.contains("requires you to log on") || res.contains("You must be logged in") {
-        anyhow::bail!("保存设置失败：会话已失效，请重新登录");
-    }
-    Ok("设置已成功提交保存".to_string())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::sanitize_filename;
+    use super::{sanitize_filename, append_nl_param};
 
     #[test]
     fn sanitize_long_cjk_name_does_not_panic() {
@@ -924,5 +1362,23 @@ mod tests {
     #[test]
     fn sanitize_empty_falls_back_to_torrent() {
         assert_eq!(sanitize_filename("   "), "torrent");
+    }
+
+    #[test]
+    fn test_append_nl_param_fresh_url() {
+        let u = "https://e-hentai.org/s/123/456-1";
+        assert_eq!(append_nl_param(u, "98765-11223"), "https://e-hentai.org/s/123/456-1?nl=98765-11223");
+    }
+
+    #[test]
+    fn test_append_nl_param_replaces_existing_nl() {
+        let u = "https://e-hentai.org/s/123/456-1?nl=111-222";
+        assert_eq!(append_nl_param(u, "98765-11223"), "https://e-hentai.org/s/123/456-1?nl=98765-11223");
+    }
+
+    #[test]
+    fn test_append_nl_param_preserves_other_params() {
+        let u = "https://e-hentai.org/s/123/456-1?foo=bar&nl=111-222&baz=qux";
+        assert_eq!(append_nl_param(u, "98765-11223"), "https://e-hentai.org/s/123/456-1?foo=bar&baz=qux&nl=98765-11223");
     }
 }

@@ -8,9 +8,27 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls", "stream"] }
+# Feature choices matter a lot here — see docs/PERFORMANCE_REVIEW.md (P1-1).
+# `default-features = false` used to silently drop three things that a
+# network-heavy client really wants:
+#   http2  — without it every parallel request needs its own TCP+TLS connection.
+#            The app allows ~96 concurrent requests per CDN host, so HTTP/1.1
+#            meant ~96 simultaneous connections (slow, and looks abusive to the
+#            CDN). HTTP/2 multiplexes them over 1-2 connections.
+#   gzip / brotli — without them reqwest sends no `Accept-Encoding`, so the
+#            server returns uncompressed HTML (tens of KB per list/detail page).
+#   charset — lets `Response::text()` honour the Content-Type charset.
+# All of these were verified absent from Cargo.lock before this change
+# (no `h2`, no `async-compression`, no `brotli` in the dependency graph).
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "cookies", "rustls-tls", "stream",
+    "http2", "gzip", "brotli", "charset",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# `Bytes` is a ref-counted slice, so cached image bodies can be handed out
+# without copying them (see PERFORMANCE_REVIEW.md P1-7).
+bytes = "1"
 image = "0.25"
 webp = "0.3"
 scraper = "0.19"
@@ -22,10 +40,22 @@ futures = "0.3"
 log = "0.4"
 urlencoding = "2.1.3"
 jni = { version = "0.21", default-features = false }
+# Without a logger installed every `log::*` call in this crate was silently
+# dropped, so none of its diagnostics ever reached logcat.
+android_logger = "0.13"
 
 [profile.release]
-opt-level = "z"
+# `"z"` optimises for binary *size*, which is the wrong trade for a
+# performance-first backend: it slows down HTML parsing, serde, and the tag
+# lookup. `3` costs a few hundred KB on a 5.5 MB APK and buys real speed.
+opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# NOTE: deliberately NOT `panic = "abort"` any more.
+#
+# `abort` makes any Rust panic a SIGABRT that takes the whole app down, and it
+# also makes `catch_unwind` useless — and this crate parses untrusted
+# third-party HTML, where a slice/index panic is the realistic failure mode.
+# Unwinding costs a little size but lets the JNI layer convert a panic into an
+# error response instead of a crash.
 strip = true

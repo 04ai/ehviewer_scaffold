@@ -1,15 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- Allow all HTTPS traffic (standard TLS) -->
+    <!-- Enforce HTTPS for standard traffic by default -->
     <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
             <certificates src="system"/>
         </trust-anchors>
     </base-config>
-    <!-- Allow e-hentai and exhentai domains -->
-    <domain-config cleartextTrafficPermitted="false">
+    <!-- Allow e-hentai, exhentai, ehgt CDN and hath domains -->
+    <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">e-hentai.org</domain>
         <domain includeSubdomains="true">exhentai.org</domain>
+        <domain includeSubdomains="true">ehgt.org</domain>
+        <domain includeSubdomains="true">hath.network</domain>
         <trust-anchors>
             <certificates src="system"/>
         </trust-anchors>

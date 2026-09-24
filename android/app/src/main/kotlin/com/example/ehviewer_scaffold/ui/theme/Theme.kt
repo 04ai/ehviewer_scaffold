@@ -1,53 +1,62 @@
 package com.example.ehviewer_scaffold.ui.theme
 
-import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
 
-private val DarkColorScheme = darkColorScheme(
-    primary = EhPrimaryDark,
-    onPrimary = EhOnPrimaryDark,
-    primaryContainer = EhPrimaryContainerDark,
-    onPrimaryContainer = EhOnPrimaryContainerDark,
-    secondary = EhSecondaryDark,
-    onSecondary = EhOnSecondaryDark,
-    secondaryContainer = EhSecondaryContainerDark,
-    onSecondaryContainer = EhOnSecondaryContainerDark,
-    background = AmoledBackground,
-    surface = AmoledSurface
-)
-
-private val LightColorScheme = lightColorScheme(
-    primary = EhPrimaryLight,
-    onPrimary = EhOnPrimaryLight,
-    primaryContainer = EhPrimaryContainerLight,
-    onPrimaryContainer = EhOnPrimaryContainerLight,
-    secondary = EhSecondaryLight,
-    onSecondary = EhOnSecondaryLight,
-    secondaryContainer = EhSecondaryContainerLight,
-    onSecondaryContainer = EhOnSecondaryContainerLight
-)
+/**
+ * 根据主题名称和当前深色/AMOLED 模式选取 ColorScheme。
+ * - amoledBlack 优先级最高：深色模式下强制纯黑背景。
+ * - themeColorName: "经典绿" | "樱花粉" | "静谧蓝"
+ */
+private fun resolveColorScheme(
+    themeColorName: String,
+    darkTheme: Boolean,
+    amoledBlack: Boolean
+): ColorScheme {
+    return when (themeColorName) {
+        "樱花粉" -> when {
+            darkTheme && amoledBlack -> PinkAmoledScheme
+            darkTheme                -> PinkDarkScheme
+            else                     -> PinkLightScheme
+        }
+        "静谧蓝" -> when {
+            darkTheme && amoledBlack -> BlueAmoledScheme
+            darkTheme                -> BlueDarkScheme
+            else                     -> BlueLightScheme
+        }
+        else -> /* 经典绿 (默认) */ when {
+            darkTheme && amoledBlack -> GreenAmoledScheme
+            darkTheme                -> GreenDarkScheme
+            else                     -> GreenLightScheme
+        }
+    }
+}
 
 @Composable
 fun EhTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true,
+    darkTheme: Boolean = false,
+    amoledBlack: Boolean = false,
+    themeColorName: String = "经典绿",
     content: @Composable () -> Unit
 ) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+    val view = LocalContext.current as? android.app.Activity
+    if (view != null) {
+        androidx.compose.runtime.SideEffect {
+            val window = view.window
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
+            window.statusBarColor = android.graphics.Color.TRANSPARENT
+            window.navigationBarColor = android.graphics.Color.TRANSPARENT
+            androidx.core.view.WindowCompat.getInsetsController(
+                window, view.window.decorView
+            ).isAppearanceLightStatusBars = !darkTheme
         }
-        darkTheme -> DarkColorScheme
-        else -> LightColorScheme
     }
+
+    val colorScheme = resolveColorScheme(themeColorName, darkTheme, amoledBlack)
 
     MaterialTheme(
         colorScheme = colorScheme,

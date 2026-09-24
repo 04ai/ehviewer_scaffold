@@ -9,8 +9,6 @@ import coil3.fetch.Fetcher
 import coil3.fetch.SourceFetchResult
 import coil3.request.Options
 import com.example.ehviewer_scaffold.rust.EhRustBridge
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import okio.FileSystem
 import okio.Path.Companion.toPath
 
@@ -31,18 +29,22 @@ class RustImageFetcher(
 ) : Fetcher {
 
     override suspend fun fetch(): FetchResult? {
-        // JNI 调用在 IO 线程执行（Rust 内部 block_on Tokio runtime）
-        val localFileUri = withContext(Dispatchers.IO) {
-            EhRustBridge.fetchAndCacheImage(viewerUrl)
+        // Fully async: this suspends without holding a JVM thread while Rust does
+        // the resolve + download on its own runtime, and cancelling the calling
+        // coroutine (page scrolled away, screen closed) aborts the native task.
+        // Previously this blocked a Dispatchers.IO thread for the whole
+        // round-trip, which capped reader concurrency at the thread-pool size.
+        val rawPath = try {
+            EhRustBridge.fetchImagePath(viewerUrl)
+        } catch (_: Exception) {
+            return null
         }
-
-        if (localFileUri.isEmpty()) {
+        if (rawPath.isEmpty()) {
             return null
         }
 
-        // Strip "file://" scheme; okio needs the raw filesystem path
-        val rawPath = localFileUri.removePrefix("file://")
-        val path = rawPath.toPath()
+        // Rust hands back a "file://" URI; okio wants the raw filesystem path.
+        val path = rawPath.removePrefix("file://").toPath()
         if (!FileSystem.SYSTEM.exists(path)) {
             return null
         }

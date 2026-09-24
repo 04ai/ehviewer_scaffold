@@ -17,8 +17,38 @@ data class GalleryItem(
     @SerialName("thumb_url") val thumbUrl: String = "",
     val category: String = "Non-H",
     val uploader: String = "",
-    @SerialName("post_date") val postDate: String = ""
-)
+    @SerialName("post_date") val postDate: String = "",
+    /**
+     * Real cover dimensions parsed from the listing HTML (0 when unavailable).
+     *
+     * Waterfall cells derive their aspect ratio from these so a wide cover is
+     * laid out at its native ratio instead of being centre-cropped into a
+     * portrait box.
+     */
+    @SerialName("thumb_width") val thumbWidth: Int = 0,
+    @SerialName("thumb_height") val thumbHeight: Int = 0
+) {
+    /**
+     * Cover width / height, clamped to a sane range.
+     *
+     * Falls back to 0.72 (the classic EH portrait thumb ratio) when the server
+     * did not report usable dimensions. The clamp keeps pathological or
+     * mis-parsed values from producing absurdly tall or short cells.
+     */
+    val coverAspectRatio: Float
+        get() {
+            if (thumbWidth <= 0 || thumbHeight <= 0) return DEFAULT_COVER_ASPECT
+            val ratio = thumbWidth.toFloat() / thumbHeight.toFloat()
+            return ratio.coerceIn(MIN_COVER_ASPECT, MAX_COVER_ASPECT)
+        }
+
+    companion object {
+        /** Classic EH thumbnail proportions (250x346), used when unknown. */
+        const val DEFAULT_COVER_ASPECT = 0.72f
+        private const val MIN_COVER_ASPECT = 0.4f
+        private const val MAX_COVER_ASPECT = 3.0f
+    }
+}
 
 @Immutable
 @Serializable

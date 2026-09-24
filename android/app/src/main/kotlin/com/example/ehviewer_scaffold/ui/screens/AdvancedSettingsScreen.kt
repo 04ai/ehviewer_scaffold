@@ -1,6 +1,8 @@
 package com.example.ehviewer_scaffold.ui.screens
 
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -27,7 +29,10 @@ import com.example.ehviewer_scaffold.ui.settings.AppSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -70,20 +75,13 @@ fun AdvancedSettingsScreen(
 
     LaunchedEffect(Unit) {
         calculateCacheSize()
-        // On screen entry: if auto-clean is enabled, trigger a background Rust cache sweep
-        if (autoCleanExpired) {
-            scope.launch(Dispatchers.IO) {
-                val days = AppSettings.getAutoCleanPeriodDays(context)
-                val freed = EhRustBridge.clearExpiredCache(days)
-                if (freed > 0) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "已自动清理 ${freed / 1024 / 1024} MB 过期缓存", Toast.LENGTH_SHORT).show()
-                    }
-                    calculateCacheSize()
-                }
-            }
-        }
     }
+
+    // NOTE: the "auto clean expired cache" switch is intentionally *not* acted
+    // on here any more. It used to sweep on screen entry, which meant the
+    // switch only did anything for users who happened to open this page.
+    // The sweep now runs once per cold start in EhApplication, where the name
+    // "automatic" actually applies; the button further down stays manual.
 
     Scaffold(
         topBar = {
@@ -386,11 +384,36 @@ fun AdvancedSettingsScreen(
             )
 
             // 导出应用数据
+            var exportStatus by remember { mutableStateOf("") }
+            val exportLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.CreateDocument("application/json")
+            ) { uri ->
+                if (uri == null) return@rememberLauncherForActivityResult
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val prefs = context.getSharedPreferences("eh_app_settings", android.content.Context.MODE_PRIVATE)
+                        val json = JSONObject(prefs.all.mapValues { it.value.toString() })
+                        context.contentResolver.openOutputStream(uri)?.use { os ->
+                            os.write(json.toString(2).toByteArray())
+                        }
+                        withContext(Dispatchers.Main) {
+                            exportStatus = "备份成功"
+                            Toast.makeText(context, "已成功导出备份文件", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "导出失败：${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable {
-                        Toast.makeText(context, "已将历史记录和设置备份至本地存储", Toast.LENGTH_SHORT).show()
+                        val timestamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.getDefault()).format(Date())
+                        exportLauncher.launch("ehru_backup_$timestamp.json")
                     }
                     .padding(horizontal = 20.dp, vertical = 16.dp)
             ) {
@@ -401,19 +424,58 @@ fun AdvancedSettingsScreen(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "将历史记录和设置导出为备份文件",
+                    text = if (exportStatus.isNotEmpty()) exportStatus else "将所有设置导出为 JSON 备份文件",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (exportStatus.isNotEmpty()) tealGreen else MaterialTheme.colorScheme.onSurfaceVariant,
                     fontSize = 13.sp
                 )
             }
 
             // 导入应用数据
+            var importStatus by remember { mutableStateOf("") }
+            val importLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.OpenDocument()
+            ) { uri ->
+                if (uri == null) return@rememberLauncherForActivityResult
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val jsonStr = context.contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) } ?: ""
+                        val json = JSONObject(jsonStr)
+                        val prefs = context.getSharedPreferences("eh_app_settings", android.content.Context.MODE_PRIVATE)
+                        val editor = prefs.edit()
+                        val keys = json.keys()
+                        var count = 0
+                        while (keys.hasNext()) {
+                            val key = keys.next()
+                            val value = json.getString(key)
+                            // Try to restore as the correct type by peeking at current value type
+                            when (prefs.all[key]) {
+                                is Boolean -> editor.putBoolean(key, value.toBooleanStrictOrNull() ?: value == "true")
+                                is Int -> editor.putInt(key, value.toIntOrNull() ?: 0)
+                                is Float -> editor.putFloat(key, value.toFloatOrNull() ?: 0f)
+                                is Long -> editor.putLong(key, value.toLongOrNull() ?: 0L)
+                                else -> editor.putString(key, value)
+                            }
+                            count++
+                        }
+                        editor.apply()
+                        withContext(Dispatchers.Main) {
+                            importStatus = "已恢复 $count 项设置"
+                            Toast.makeText(context, "备份导入成功，重启 App 后完全生效", Toast.LENGTH_LONG).show()
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "导入失败：${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable {
-                        Toast.makeText(context, "请选择备份文件 (.json)", Toast.LENGTH_SHORT).show()
+                        importLauncher.launch(arrayOf("application/json", "*/*"))
                     }
                     .padding(horizontal = 20.dp, vertical = 16.dp)
             ) {
@@ -421,6 +483,13 @@ fun AdvancedSettingsScreen(
                     text = "导入应用数据",
                     style = MaterialTheme.typography.bodyLarge,
                     fontSize = 16.sp
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (importStatus.isNotEmpty()) importStatus else "从 JSON 备份文件恢复设置",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (importStatus.isNotEmpty()) tealGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 13.sp
                 )
             }
         }

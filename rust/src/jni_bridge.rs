@@ -1,11 +1,19 @@
 use jni::JNIEnv;
-use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jint, jstring};
+use jni::objects::{GlobalRef, JClass, JString, JValue};
+use jni::sys::{jboolean, jint, jfloat, jlong, jstring};
+use jni::JavaVM;
 use crate::api;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use tokio::sync::Semaphore;
 
 lazy_static::lazy_static! {
     static ref RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        // 8 rather than 4: this runtime also drives CPU-bound work (HTML parsing,
+        // the tag-database search), which would otherwise occupy workers that
+        // concurrent image downloads need. The tasks are mostly I/O-bound, so
+        // the extra threads cost little.
+        .worker_threads(8)
         .enable_all()
         .build()
         .expect("Failed to initialize Tokio runtime for Eh-ru JNI");
@@ -115,13 +123,20 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_fetchGal
     page_url: JString<'local>,
     query: JString<'local>,
     options_json: JString<'local>,
+    force_refresh: jboolean,
 ) -> jstring {
     let pu = jstring_to_string(&mut env, page_url);
     let q = jstring_to_string(&mut env, query);
     let opt: Option<api::SearchOptions> = jstring_to_string(&mut env, options_json)
         .and_then(|j| serde_json::from_str(&j).ok());
 
-    let res = RUNTIME.block_on(api::fetch_gallery_list(page as u32, pu, q, opt));
+    let res = RUNTIME.block_on(api::fetch_gallery_list(
+        page as u32,
+        pu,
+        q,
+        opt,
+        force_refresh != 0,
+    ));
     let json = result_to_json(res);
     string_to_jstring(&mut env, &json)
 }
@@ -135,6 +150,7 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_fetchCus
     page_url: JString<'local>,
     query: JString<'local>,
     options_json: JString<'local>,
+    force_refresh: jboolean,
 ) -> jstring {
     let p = jstring_to_string(&mut env, path).unwrap_or_default();
     let pu = jstring_to_string(&mut env, page_url);
@@ -142,7 +158,14 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_fetchCus
     let opt: Option<api::SearchOptions> = jstring_to_string(&mut env, options_json)
         .and_then(|j| serde_json::from_str(&j).ok());
 
-    let res = RUNTIME.block_on(api::fetch_custom_list(p, page as u32, pu, q, opt));
+    let res = RUNTIME.block_on(api::fetch_custom_list(
+        p,
+        page as u32,
+        pu,
+        q,
+        opt,
+        force_refresh != 0,
+    ));
     let json = result_to_json(res);
     string_to_jstring(&mut env, &json)
 }
@@ -206,6 +229,17 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_fetchAnd
     }
 }
 
+/// Retrieve current image download progress for a reader viewer URL (0.0 .. 1.0)
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_getImageProgress<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    viewer_url: JString<'local>,
+) -> jfloat {
+    let u = jstring_to_string(&mut env, viewer_url).unwrap_or_default();
+    crate::api::get_image_progress(&u)
+}
+
 #[no_mangle]
 pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_startDownload<'local>(
     mut env: JNIEnv<'local>,
@@ -236,6 +270,31 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_pauseDow
     let g = jstring_to_string(&mut env, gid).unwrap_or_default();
     let res = RUNTIME.block_on(api::pause_download(g));
     (res.is_ok()) as jboolean
+}
+
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_resumeDownload<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    gid: JString<'local>,
+) -> jboolean {
+    let g = jstring_to_string(&mut env, gid).unwrap_or_default();
+    let res = RUNTIME.block_on(api::resume_download(g));
+    (res.is_ok()) as jboolean
+}
+
+/// Absolute paths of a gallery's downloaded pages, page-ordered, as a JSON
+/// array. Backs the offline reader (opening a finished download).
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_getDownloadedPages<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    gid: JString<'local>,
+) -> jstring {
+    let g = jstring_to_string(&mut env, gid).unwrap_or_default();
+    let pages = RUNTIME.block_on(api::get_downloaded_pages(g));
+    let json = serde_json::to_string(&pages).unwrap_or_else(|_| "[]".to_string());
+    string_to_jstring(&mut env, &json)
 }
 
 #[no_mangle]
@@ -299,6 +358,26 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_fetchTor
     let g = jstring_to_string(&mut env, gid).unwrap_or_default();
     let t = jstring_to_string(&mut env, token).unwrap_or_default();
     let res = RUNTIME.block_on(api::fetch_torrents(g, t));
+    let json = result_to_json(res);
+    string_to_jstring(&mut env, &json)
+}
+
+/// Fetch one `.torrent` file from the tracker and save it under the downloads
+/// directory (`<downloads>/torrents/<sanitized name>.torrent`).
+///
+/// Returns the saved absolute path as a JSON string, or `{"error": "..."}`.
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_downloadTorrent<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    name: JString<'local>,
+    hash: JString<'local>,
+    token: JString<'local>,
+) -> jstring {
+    let n = jstring_to_string(&mut env, name).unwrap_or_default();
+    let h = jstring_to_string(&mut env, hash).unwrap_or_default();
+    let t = jstring_to_string(&mut env, token).unwrap_or_default();
+    let res = RUNTIME.block_on(api::download_torrent(n, h, t));
     let json = result_to_json(res);
     string_to_jstring(&mut env, &json)
 }
@@ -392,6 +471,26 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_translat
     string_to_jstring(&mut env, &trans)
 }
 
+/// Batch variant of [`translateTagSync`]: takes a JSON array of
+/// `[["namespace","tag"], ...]` and returns a JSON object of
+/// `{"namespace:tag": "translation"}`.
+///
+/// Exists because a gallery can carry 60–120 tags, and one JNI round-trip plus
+/// one `TAG_DB` lock acquisition *per tag* was the dominant cost of opening a
+/// detail page. One call replaces the whole batch.
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_translateTagsJson<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    pairs_json: JString<'local>,
+) -> jstring {
+    let raw = jstring_to_string(&mut env, pairs_json).unwrap_or_default();
+    let pairs: Vec<(String, String)> = serde_json::from_str(&raw).unwrap_or_default();
+    let map = api::translate_tags_batch(pairs);
+    let json = serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string());
+    string_to_jstring(&mut env, &json)
+}
+
 #[no_mangle]
 pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_searchTagByChinese<'local>(
     mut env: JNIEnv<'local>,
@@ -401,6 +500,29 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_searchTa
     let kw = jstring_to_string(&mut env, keyword).unwrap_or_default();
     let suggestions = api::search_tag_by_chinese(kw);
     let json = serde_json::to_string(&suggestions).unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
+    string_to_jstring(&mut env, &json)
+}
+
+/// Server-side tag completion (`api.php` method `tagsuggest`).
+///
+/// Kept separate from `searchTagByChinese` on purpose: that one is a purely
+/// in-memory scan safe to run on every keystroke, while this one is a network
+/// round-trip the UI fires debounced and merges with the local results.
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_suggestTagsOnline<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    keyword: JString<'local>,
+) -> jstring {
+    let kw = jstring_to_string(&mut env, keyword).unwrap_or_default();
+    let suggestions = RUNTIME.block_on(api::suggest_tags_online(kw));
+    let json = match suggestions {
+        Ok(list) => serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string()),
+        Err(e) => {
+            log::warn!("suggestTagsOnline failed: {}", e);
+            "[]".to_string()
+        }
+    };
     string_to_jstring(&mut env, &json)
 }
 
@@ -472,6 +594,44 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_addWatch
     }
 }
 
+/// Replace the blocked-tag list.
+///
+/// `tags_json` is a JSON array; each entry is either `namespace:tag` (what
+/// long-pressing a tag on the detail screen produces) or a bare tag typed by
+/// hand in the settings screen. Kotlin's SharedPreferences stays authoritative
+/// and replays this at cold start.
+///
+/// Always returns true: the list is stored unconditionally, and a malformed
+/// payload degrades to an empty list rather than an error worth surfacing.
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_setBlockedTags<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    tags_json: JString<'local>,
+) -> jboolean {
+    let raw = jstring_to_string(&mut env, tags_json).unwrap_or_default();
+    let tags: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+    api::set_blocked_tags(tags);
+    1
+}
+
+/// Keep only the non-blocked gids out of a JSON array, returning a JSON array.
+///
+/// Backs the "block list changed while a list was on screen" case: the UI prunes
+/// what it already has instead of refetching and losing the scroll position.
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_filterBlockedGalleryIds<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    gids_json: JString<'local>,
+) -> jstring {
+    let raw = jstring_to_string(&mut env, gids_json).unwrap_or_default();
+    let gids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+    let kept = api::filter_blocked_ids(gids);
+    let json = serde_json::to_string(&kept).unwrap_or_else(|_| "[]".to_string());
+    string_to_jstring(&mut env, &json)
+}
+
 /// Remove a tag from the account's watched tag list (EH My Tags / /watched page).
 /// Returns the result message or empty string on error.
 #[no_mangle]
@@ -487,5 +647,258 @@ pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_removeWa
             log::error!("removeWatchedTag failed: {}", e);
             string_to_jstring(&mut env, "")
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Async image fetch — Rust owns the task, Kotlin just parks a coroutine
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Every other entry point in this file ends in `RUNTIME.block_on(...)`, which
+// pins the *calling* Kotlin thread for the whole network round-trip. That makes
+// "requests in flight" and "JVM threads consumed" the same number, so reader
+// throughput is capped by `Dispatchers.IO`'s 64 threads no matter how fast the
+// network is.
+//
+// The image path is the one worth fixing: it is high frequency, it is naturally
+// cancellable (scroll past a page and the fetch should die), and its result is a
+// small string. So it is the one path that runs fully async.
+//
+// Metadata calls (list / detail / comments / favourites) deliberately stay on
+// `block_on`: they are low frequency, the user is actively waiting on them, and
+// cancellation would mean nothing. See docs/JNI_ASYNC_DESIGN_REVIEW.md.
+
+/// Upper bound on concurrently running image tasks.
+///
+/// Decoupling from JVM threads does NOT mean the limit can be dropped: hundreds
+/// of parallel sockets would saturate the link and invite CDN rate limiting.
+/// This is now a *policy* cap instead of an accident of the thread pool.
+const MAX_CONCURRENT_IMAGE_TASKS: usize = 24;
+
+/// `JavaVM` + `EhRustBridge` class ref, captured lazily on the first submit.
+///
+/// Deliberately not done in `JNI_OnLoad`: the values are already in hand at
+/// every JNI call, there is nothing to do before the first one, and it avoids
+/// hand-writing an FFI entry point whose exact signature is easy to get wrong.
+static JVM: OnceLock<JavaVM> = OnceLock::new();
+static BRIDGE_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+
+struct ImageTask {
+    /// Set by `nativeCancelImageFetch`. Checked again after `spawn`, because a
+    /// cancel can land while the `AbortHandle` does not exist yet.
+    abort_requested: bool,
+    /// Filled in immediately after `spawn`.
+    handle: Option<tokio::task::AbortHandle>,
+}
+
+static IMAGE_TASKS: OnceLock<Mutex<HashMap<i64, ImageTask>>> = OnceLock::new();
+static IMAGE_SLOTS: OnceLock<Semaphore> = OnceLock::new();
+
+fn image_tasks() -> std::sync::MutexGuard<'static, HashMap<i64, ImageTask>> {
+    IMAGE_TASKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        // A panic while the map was locked must not turn every later call into
+        // another panic; it only holds bookkeeping, so recover the data.
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn image_slots() -> &'static Semaphore {
+    IMAGE_SLOTS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_IMAGE_TASKS))
+}
+
+/// Capture the JVM handle and bridge class on first use.
+fn cache_jvm_and_class(env: &mut JNIEnv, class: &JClass) {
+    if JVM.get().is_none() {
+        match env.get_java_vm() {
+            Ok(vm) => {
+                let _ = JVM.set(vm);
+            }
+            Err(e) => log::error!("could not cache JavaVM: {}", e),
+        }
+    }
+    if BRIDGE_CLASS.get().is_none() {
+        match env.new_global_ref(class) {
+            Ok(g) => {
+                let _ = BRIDGE_CLASS.set(g);
+            }
+            Err(e) => log::error!("could not cache bridge class ref: {}", e),
+        }
+    }
+}
+
+/// Guarantees Kotlin is always woken and the registry entry always removed.
+///
+/// This is the fix for the one *fatal* flaw in the originally proposed design:
+/// if the task panicked — or the future was dropped by an abort — the plain
+/// "call dispatch at the end of the async block" approach never reaches
+/// `dispatch_*`, so the Kotlin coroutine stays suspended **forever**, with no
+/// log and no recovery. A `Drop` guard runs on both those paths.
+struct CompletionGuard {
+    task_id: i64,
+    /// Set as soon as a result exists, so the guard does not fire a second,
+    /// contradictory callback.
+    completed: bool,
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        image_tasks().remove(&self.task_id);
+        if !self.completed {
+            // Cancelled, or panicked. If Kotlin already discarded this task id
+            // the callback is a harmless no-op — which is exactly why the Kotlin
+            // side removes the continuation atomically.
+            dispatch_error(self.task_id, "image request ended without a result");
+        }
+    }
+}
+
+/// Attach the current (Tokio worker) thread as a daemon and hand the closure a
+/// usable `JNIEnv` plus the bridge class.
+///
+/// `attach_current_thread_as_daemon` is cheap on repeat calls: the thread is
+/// attached once and the `JNIEnv*` is reused from thread-local storage, so a
+/// long-lived Tokio worker pays this only on its first callback. Attaching as a
+/// daemon also means those threads never block JVM shutdown.
+fn with_bridge_env<F: FnOnce(&mut JNIEnv, &JClass)>(f: F) {
+    let (Some(vm), Some(class_ref)) = (JVM.get(), BRIDGE_CLASS.get()) else {
+        log::error!("image callback dropped: JVM or bridge class not cached yet");
+        return;
+    };
+    let Ok(mut env) = vm.attach_current_thread_as_daemon() else {
+        log::error!("image callback dropped: could not attach thread to JVM");
+        return;
+    };
+    // `GlobalRef::as_obj()` is a `&JObject`; jni provides a *safe* reference
+    // cast from `&JObject` to `&JClass`, so no raw pointers are needed here.
+    let class: &JClass = class_ref.as_obj().into();
+    f(&mut env, class);
+}
+
+fn dispatch_success(task_id: i64, path: &str) {
+    with_bridge_env(|env, class| {
+        let Ok(jpath) = env.new_string(path) else {
+            log::error!("image callback dropped: could not allocate result string");
+            return;
+        };
+        let _ = env.call_static_method(
+            class,
+            "onNativeImageSuccess",
+            "(JLjava/lang/String;)V",
+            &[JValue::Long(task_id), JValue::Object(&jpath)],
+        );
+    });
+}
+
+fn dispatch_error(task_id: i64, message: &str) {
+    with_bridge_env(|env, class| {
+        let Ok(jmsg) = env.new_string(message) else {
+            return;
+        };
+        let _ = env.call_static_method(
+            class,
+            "onNativeImageError",
+            "(JLjava/lang/String;)V",
+            &[JValue::Long(task_id), JValue::Object(&jmsg)],
+        );
+    });
+}
+
+/// Submit an image fetch. Returns immediately — this only registers the task and
+/// hands it to the Tokio runtime.
+///
+/// The callback delivers an absolute `file://`-less path (the caller prefixes
+/// the scheme). Note it is a *path*, not the image bytes: shipping a 500 KB –
+/// 5 MB byte array across JNI would copy the whole payload and bypass the disk
+/// cache that the reader is designed around.
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_nativeSubmitImageFetch<'local>(
+    mut env: JNIEnv<'local>,
+    class: JClass<'local>,
+    task_id: jlong,
+    viewer_url: JString<'local>,
+) {
+    cache_jvm_and_class(&mut env, &class);
+
+    let url = match jstring_to_string(&mut env, viewer_url) {
+        Some(u) if !u.is_empty() => u,
+        _ => {
+            dispatch_error(task_id, "empty viewer url");
+            return;
+        }
+    };
+
+    // Register before spawning, preserving any abort that already arrived, so a
+    // cancel landing in the window around `spawn` is not lost.
+    {
+        let mut tasks = image_tasks();
+        let already_aborted = tasks.get(&task_id).map(|t| t.abort_requested).unwrap_or(false);
+        tasks.insert(
+            task_id,
+            ImageTask {
+                abort_requested: already_aborted,
+                handle: None,
+            },
+        );
+    }
+
+    let handle = RUNTIME.spawn(async move {
+        // Policy cap on sockets/bandwidth. Acquired inside the task so `submit`
+        // itself never blocks.
+        let _slot = image_slots().acquire().await;
+
+        let mut guard = CompletionGuard {
+            task_id,
+            completed: false,
+        };
+
+        let outcome = api::fetch_and_cache_image(url).await;
+        // A result now exists, so the guard must not add its own callback.
+        guard.completed = true;
+
+        match outcome {
+            Ok(path) => dispatch_success(task_id, &path),
+            Err(e) => dispatch_error(task_id, &e.to_string()),
+        }
+    });
+
+    // Publish the abort handle, and honour a cancel that beat us to it.
+    let abort_now = {
+        let mut tasks = image_tasks();
+        match tasks.get_mut(&task_id) {
+            Some(t) => {
+                t.handle = Some(handle.abort_handle());
+                t.abort_requested
+            }
+            // Already finished and cleaned up — nothing to abort.
+            None => false,
+        }
+    };
+    if abort_now {
+        handle.abort();
+    }
+}
+
+/// Cancel an in-flight image fetch (the coroutine was cancelled, or the page
+/// scrolled away). Dropping the future closes the socket.
+#[no_mangle]
+pub extern "C" fn Java_com_example_ehviewer_1scaffold_rust_EhRustBridge_nativeCancelImageFetch<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    task_id: jlong,
+) {
+    let handle = {
+        let mut tasks = image_tasks();
+        // `or_insert` matters: a cancel can arrive before `submit` registered,
+        // and the tombstone it leaves is what the submitter then honours.
+        let entry = tasks.entry(task_id).or_insert(ImageTask {
+            abort_requested: true,
+            handle: None,
+        });
+        entry.abort_requested = true;
+        entry.handle.take()
+    };
+    if let Some(h) = handle {
+        h.abort();
     }
 }

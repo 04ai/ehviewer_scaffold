@@ -1,22 +1,42 @@
 package com.example.ehviewer_scaffold.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.ehviewer_scaffold.MainActivity
 import com.example.ehviewer_scaffold.ui.settings.AppSettings
+
+// 可选主题定义：只保留 3 个
+private data class ThemeOption(
+    val name: String,
+    val lightColor: Color,
+    val darkColor: Color,
+    val label: String
+)
+
+private val THEME_OPTIONS = listOf(
+    ThemeOption("经典绿", Color(0xFF2E6B4F), Color(0xFF99D5B3), "经典绿"),
+    ThemeOption("樱花粉", Color(0xFFC2185B), Color(0xFFFFAFCB), "樱花粉"),
+    ThemeOption("静谧蓝", Color(0xFF1565C0), Color(0xFFAAC7FF), "静谧蓝"),
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -25,19 +45,34 @@ fun AppearanceSettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val activity = context as? MainActivity
 
-    var followSystem by remember { mutableStateOf(AppSettings.isThemeFollowSystem(context)) }
-    var amoledBlack by remember { mutableStateOf(AppSettings.isAmoledBlack(context)) }
-    var pixelShift by remember { mutableStateOf(AppSettings.isPixelShift(context)) }
-    var glassmorphism by remember { mutableStateOf(AppSettings.isGlassmorphism(context)) }
+    // ── 读取当前设置 ────────────────────────────────────────────────────────
+    var amoledBlack    by remember { mutableStateOf(AppSettings.isAmoledBlack(context)) }
+    var followSystem   by remember { mutableStateOf(AppSettings.isThemeFollowSystem(context)) }
+    var pixelShift     by remember { mutableStateOf(AppSettings.isPixelShift(context)) }
+    var glassmorphism  by remember { mutableStateOf(AppSettings.isGlassmorphism(context)) }
     var hapticFeedback by remember { mutableStateOf(AppSettings.isHapticFeedback(context)) }
-    var themeColor by remember { mutableStateOf(AppSettings.getThemeColor(context)) }
-    var listMode by remember { mutableStateOf(AppSettings.getListMode(context)) }
+    var themeColor     by remember { mutableStateOf(AppSettings.getThemeColor(context)) }
+    var listMode       by remember { mutableStateOf(AppSettings.getListMode(context)) }
 
-    var showColorDialog by remember { mutableStateOf(false) }
     var showListModeDialog by remember { mutableStateOf(false) }
 
-    val primaryTeal = Color(0xFF00796B)
+    // 主色跟随当前主题 primary
+    val primaryColor  = MaterialTheme.colorScheme.primary
+    val cardShape     = RoundedCornerShape(16.dp)
+    val isDark        = MaterialTheme.colorScheme.background.red < 0.5f
+
+    // 通用 Switch 颜色
+    val switchColors = SwitchDefaults.colors(
+        checkedThumbColor  = Color.White,
+        checkedTrackColor  = primaryColor
+    )
+
+    /** 保存某个外观设置后同步刷新 MainActivity 的主题状态 */
+    fun saveAndRefresh() {
+        activity?.refreshThemeSettings()
+    }
 
     Scaffold(
         topBar = {
@@ -50,6 +85,7 @@ fun AppearanceSettingsScreen(
                 }
             )
         },
+        containerColor = MaterialTheme.colorScheme.background,
         modifier = modifier
     ) { innerPadding ->
         Column(
@@ -57,237 +93,184 @@ fun AppearanceSettingsScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(22.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp)
         ) {
-            // ─── 跟随系统深色模式 ──────────────────────────────────────────
-            Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("跟随系统深色模式", style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
-                Switch(
-                    checked = followSystem,
-                    onCheckedChange = {
-                        followSystem = it
-                        AppSettings.setThemeFollowSystem(context, it)
-                    },
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = primaryTeal
-                    )
-                )
-            }
 
-            // ─── 纯粹 AMOLED 黑 ────────────────────────────────────────────
-            Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            // ══════════════════════════════════════════════════════════════
+            // 1. 黑暗模式  (AMOLED 黑为最优先项)
+            // ══════════════════════════════════════════════════════════════
+            SectionLabel("黑暗模式")
+            Card(
+                shape = cardShape,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
-                    Text("纯粹 AMOLED 黑", style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        "针对 OLED 屏幕优化，深色模式下使用纯黑背景防烧屏且极度省电",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 12.sp,
-                        lineHeight = 16.sp
+                Column {
+                    // 纯粹 AMOLED 黑 ── 最优先
+                    SettingsSwitchRow(
+                        title = "纯粹 AMOLED 黑",
+                        subtitle = "深色模式下强制纯黑背景，OLED 屏极省电且防烧屏",
+                        checked = amoledBlack,
+                        switchColors = switchColors,
+                        onCheckedChange = { v ->
+                            amoledBlack = v
+                            AppSettings.setAmoledBlack(context, v)
+                            // AMOLED 开启时自动进入深色模式（关闭跟随系统）
+                            if (v) {
+                                followSystem = false
+                                AppSettings.setThemeFollowSystem(context, false)
+                            }
+                            saveAndRefresh()
+                        }
+                    )
+                    RowDivider()
+                    // 跟随系统深色模式
+                    SettingsSwitchRow(
+                        title = "跟随系统深色模式",
+                        subtitle = "自动根据系统深色/浅色模式切换主题",
+                        checked = followSystem,
+                        switchColors = switchColors,
+                        onCheckedChange = { v ->
+                            followSystem = v
+                            AppSettings.setThemeFollowSystem(context, v)
+                            saveAndRefresh()
+                        }
+                    )
+                    RowDivider()
+                    // 像素偏移防烧屏
+                    SettingsSwitchRow(
+                        title = "像素偏移（防烧屏引擎）",
+                        subtitle = "每分钟微移 1–2 像素，防止固定图案长期点亮老化屏幕",
+                        checked = pixelShift,
+                        switchColors = switchColors,
+                        onCheckedChange = { v ->
+                            pixelShift = v
+                            AppSettings.setPixelShift(context, v)
+                        }
                     )
                 }
-                Switch(
-                    checked = amoledBlack,
-                    onCheckedChange = {
-                        amoledBlack = it
-                        AppSettings.setAmoledBlack(context, it)
-                    },
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = primaryTeal
-                    )
-                )
             }
 
-            // ─── 像素偏移 (防烧屏引擎) ─────────────────────────────────────
-            Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            // ══════════════════════════════════════════════════════════════
+            // 2. 主题颜色 ── 3 个选项内联展示
+            // ══════════════════════════════════════════════════════════════
+            SectionLabel("主题颜色")
+            Card(
+                shape = cardShape,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
-                    Text("像素偏移 (防烧屏引擎)", style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        "每隔一分钟让全界面极其缓慢地微动 1-2 像素，防止固定图案长期点亮老化屏幕",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 12.sp,
-                        lineHeight = 16.sp
-                    )
+                Row(
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 20.dp)
+                ) {
+                    THEME_OPTIONS.forEach { opt ->
+                        val selected = (themeColor == opt.name)
+                        val swatch = if (isDark) opt.darkColor else opt.lightColor
+                        ThemeColorChip(
+                            label   = opt.label,
+                            color   = swatch,
+                            selected = selected,
+                            onClick = {
+                                themeColor = opt.name
+                                AppSettings.setThemeColor(context, opt.name)
+                                saveAndRefresh()
+                            }
+                        )
+                    }
                 }
-                Switch(
-                    checked = pixelShift,
-                    onCheckedChange = {
-                        pixelShift = it
-                        AppSettings.setPixelShift(context, it)
-                    },
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = primaryTeal
-                    )
-                )
             }
 
-            // ─── 毛玻璃效果 ────────────────────────────────────────────────
-            Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            // ══════════════════════════════════════════════════════════════
+            // 3. 视觉效果
+            // ══════════════════════════════════════════════════════════════
+            SectionLabel("视觉效果")
+            Card(
+                shape = cardShape,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
-                    Text("毛玻璃效果", style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        "搜索栏、阅读器浮层等使用半透明磨砂玻璃质感 (Glassmorphism)，关闭则恢复纯色",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 12.sp,
-                        lineHeight = 16.sp
+                Column {
+                    SettingsSwitchRow(
+                        title = "毛玻璃效果",
+                        subtitle = "搜索栏、浮层等使用半透明磨砂玻璃质感（Glassmorphism）",
+                        checked = glassmorphism,
+                        switchColors = switchColors,
+                        onCheckedChange = { v ->
+                            glassmorphism = v
+                            AppSettings.setGlassmorphism(context, v)
+                        }
+                    )
+                    RowDivider()
+                    SettingsSwitchRow(
+                        title = "触觉震动反馈",
+                        subtitle = "在下拉刷新、长按标签等关键节点提供细腻震动确认感",
+                        checked = hapticFeedback,
+                        switchColors = switchColors,
+                        onCheckedChange = { v ->
+                            hapticFeedback = v
+                            AppSettings.setHapticFeedback(context, v)
+                        }
                     )
                 }
-                Switch(
-                    checked = glassmorphism,
-                    onCheckedChange = {
-                        glassmorphism = it
-                        AppSettings.setGlassmorphism(context, it)
-                    },
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = primaryTeal
-                    )
-                )
             }
 
-            // ─── 触觉震动反馈 ──────────────────────────────────────────────
-            Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            // ══════════════════════════════════════════════════════════════
+            // 4. 画廊列表
+            // ══════════════════════════════════════════════════════════════
+            SectionLabel("画廊列表")
+            Card(
+                shape = cardShape,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
-                    Text("触觉震动反馈", style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
-                    Spacer(modifier = Modifier.height(2.dp))
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showListModeDialog = true }
+                        .padding(horizontal = 16.dp, vertical = 16.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                        Text(
+                            "列表模式",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontSize = 16.sp
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            "当前：$listMode",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 12.sp
+                        )
+                    }
                     Text(
-                        "在下拉刷新、长按标签等关键节点提供微弱且现代的物理震动确认感",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 12.sp,
-                        lineHeight = 16.sp
+                        text = listMode,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = primaryColor,
+                        fontWeight = FontWeight.Medium
                     )
                 }
-                Switch(
-                    checked = hapticFeedback,
-                    onCheckedChange = {
-                        hapticFeedback = it
-                        AppSettings.setHapticFeedback(context, it)
-                    },
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = primaryTeal
-                    )
-                )
-            }
-
-            // ─── 主题颜色 ──────────────────────────────────────────────────
-            Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { showColorDialog = true }
-                    .padding(vertical = 4.dp)
-            ) {
-                Text("主题颜色", style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
-                Text(
-                    text = themeColor,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            // ─── 列表模式 ──────────────────────────────────────────────────
-            Row(
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { showListModeDialog = true }
-                    .padding(vertical = 4.dp)
-            ) {
-                Text("列表模式", style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
-                Text(
-                    text = listMode,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
         }
     }
 
-    // ─── 主题颜色选择弹窗 ───────────────────────────────────────────────
-    if (showColorDialog) {
-        val colors = listOf("纯净白", "经典绿", "暗夜黑", "樱花粉", "静谧蓝")
-        AlertDialog(
-            onDismissRequest = { showColorDialog = false },
-            title = { Text("选择主题颜色", fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    colors.forEach { c ->
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .selectable(
-                                    selected = (c == themeColor),
-                                    onClick = {
-                                        themeColor = c
-                                        AppSettings.setThemeColor(context, c)
-                                        showColorDialog = false
-                                    }
-                                )
-                                .padding(vertical = 12.dp)
-                        ) {
-                            RadioButton(
-                                selected = (c == themeColor),
-                                onClick = {
-                                    themeColor = c
-                                    AppSettings.setThemeColor(context, c)
-                                    showColorDialog = false
-                                },
-                                colors = RadioButtonDefaults.colors(selectedColor = primaryTeal)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(c, fontSize = 16.sp)
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showColorDialog = false }) {
-                    Text("取消", color = primaryTeal)
-                }
-            }
-        )
-    }
-
-    // ─── 列表模式选择弹窗 ───────────────────────────────────────────────
+    // ── 列表模式选择弹窗 ─────────────────────────────────────────────────
     if (showListModeDialog) {
         val modes = listOf("瀑布流", "列表卡片", "紧凑网格")
         AlertDialog(
             onDismissRequest = { showListModeDialog = false },
-            title = { Text("选择画廊列表显示模式", fontWeight = FontWeight.Bold) },
+            title = { Text("选择画廊列表模式", fontWeight = FontWeight.Bold) },
             text = {
                 Column {
                     modes.forEach { m ->
@@ -295,15 +278,12 @@ fun AppearanceSettingsScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .selectable(
-                                    selected = (m == listMode),
-                                    onClick = {
-                                        listMode = m
-                                        AppSettings.setListMode(context, m)
-                                        showListModeDialog = false
-                                    }
-                                )
-                                .padding(vertical = 12.dp)
+                                .clickable {
+                                    listMode = m
+                                    AppSettings.setListMode(context, m)
+                                    showListModeDialog = false
+                                }
+                                .padding(vertical = 14.dp, horizontal = 4.dp)
                         ) {
                             RadioButton(
                                 selected = (m == listMode),
@@ -312,19 +292,119 @@ fun AppearanceSettingsScreen(
                                     AppSettings.setListMode(context, m)
                                     showListModeDialog = false
                                 },
-                                colors = RadioButtonDefaults.colors(selectedColor = primaryTeal)
+                                colors = RadioButtonDefaults.colors(selectedColor = primaryColor)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text(m, fontSize = 16.sp)
+                            Text(m, style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
                         }
                     }
                 }
             },
             confirmButton = {
                 TextButton(onClick = { showListModeDialog = false }) {
-                    Text("取消", color = primaryTeal)
+                    Text("取消", color = primaryColor)
                 }
             }
+        )
+    }
+}
+
+// ─── 通用子组件 ────────────────────────────────────────────────────────────
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(start = 4.dp)
+    )
+}
+
+@Composable
+private fun RowDivider() {
+    HorizontalDivider(
+        modifier = Modifier.padding(horizontal = 16.dp),
+        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+    )
+}
+
+@Composable
+private fun SettingsSwitchRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    switchColors: SwitchColors,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 14.dp)
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge, fontSize = 16.sp)
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp,
+                lineHeight = 16.sp
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = switchColors
+        )
+    }
+}
+
+@Composable
+private fun ThemeColorChip(
+    label: String,
+    color: Color,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(52.dp)
+                .clip(CircleShape)
+                .background(color)
+                .then(
+                    if (selected) Modifier.border(3.dp, MaterialTheme.colorScheme.onSurface, CircleShape)
+                    else Modifier.border(1.5.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
+                )
+        ) {
+            if (selected) {
+                Icon(
+                    Icons.Default.Check,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            fontSize = 12.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            color = if (selected) MaterialTheme.colorScheme.onSurface
+                    else MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 }

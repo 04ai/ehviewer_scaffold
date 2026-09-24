@@ -98,7 +98,12 @@ fun MainAppNavHost() {
 
         composable("downloads") {
             DownloadsScreen(
-                onBack = { navController.popBackStack() }
+                onBack = { navController.popBackStack() },
+                // Finished downloads were a dead end before this: the pages were
+                // on disk but the app offered no way to open them.
+                onOpenGallery = { gid, token ->
+                    navController.navigate("reader/$gid/$token?offline=true")
+                }
             )
         }
 
@@ -208,7 +213,19 @@ fun MainAppNavHost() {
                 onTagSearch = { tagQuery ->
                     // URL-encode to safely transport "namespace:tag" through the route
                     val encoded = URLEncoder.encode(tagQuery, "UTF-8")
-                    navController.navigate("tag_search/$encoded")
+                    // Collapse any previously visited search screen before pushing a new
+                    // one. Without this the stack grew without bound:
+                    //   tag_search -> detail -> tag_search -> detail -> tag_search ...
+                    // and every stale HomeScreen kept loading images in the background,
+                    // which is what made the UI stutter and behave unpredictably.
+                    navController.navigate("tag_search/$encoded") {
+                        // Keep at most one search result screen alive at a time.
+                        if (navController.currentDestination?.route?.startsWith("tag_search") == true) {
+                            popUpTo("tag_search/{query}") { inclusive = true }
+                        }
+                        launchSingleTop = true
+                        restoreState = false
+                    }
                 },
                 onBack = { navController.popBackStack() }
             )
@@ -251,23 +268,29 @@ fun MainAppNavHost() {
         }
 
         composable(
-            route = "reader/{gid}/{token}?page={page}",
+            route = "reader/{gid}/{token}?page={page}&offline={offline}",
             arguments = listOf(
                 navArgument("gid") { type = NavType.StringType },
                 navArgument("token") { type = NavType.StringType },
                 navArgument("page") {
                     type = NavType.IntType
                     defaultValue = 0
+                },
+                navArgument("offline") {
+                    type = NavType.BoolType
+                    defaultValue = false
                 }
             )
         ) { backStackEntry ->
             val gid = backStackEntry.arguments?.getString("gid").orEmpty()
             val token = backStackEntry.arguments?.getString("token").orEmpty()
             val page = backStackEntry.arguments?.getInt("page") ?: 0
+            val offline = backStackEntry.arguments?.getBoolean("offline") ?: false
             GalleryReaderScreen(
                 gid = gid,
                 token = token,
                 initialPage = page,
+                offline = offline,
                 onBack = { navController.popBackStack() }
             )
         }
